@@ -87,6 +87,7 @@ function Get-DefaultSettings {
         leftPanelWidth = 540
         listScale = 1.0
         previewZoom = 1.0
+        viewMode = "all"
     }
 }
 
@@ -503,6 +504,13 @@ $script:ThumbnailCache = @{}
 $script:DisplayItems = @()
 $script:ListScale = [double]$script:Settings.listScale
 $script:PreviewZoom = [double]$script:Settings.previewZoom
+$script:ViewMode = [string]$script:Settings.viewMode
+if (@("all", "image", "text") -notcontains $script:ViewMode) {
+    $script:ViewMode = "all"
+    $script:Settings.viewMode = $script:ViewMode
+}
+$script:DragStartPoint = [System.Drawing.Point]::Empty
+$script:DragItem = $null
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "历史粘贴板 - 自动保存 3 天"
@@ -538,6 +546,28 @@ $searchBox.BackColor = [System.Drawing.Color]::FromArgb(22, 32, 48)
 $searchBox.ForeColor = $ThemeText
 $searchBox.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
 
+$viewBar = New-Object System.Windows.Forms.FlowLayoutPanel
+$viewBar.Dock = "Top"
+$viewBar.Height = 40
+$viewBar.FlowDirection = "LeftToRight"
+$viewBar.BackColor = $ThemeBack
+$viewBar.Padding = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+
+$allModeButton = New-Object System.Windows.Forms.Button
+$allModeButton.Text = "全部"
+$allModeButton.Width = 70
+$allModeButton.Height = 26
+
+$imageModeButton = New-Object System.Windows.Forms.Button
+$imageModeButton.Text = "图片"
+$imageModeButton.Width = 70
+$imageModeButton.Height = 26
+
+$textModeButton = New-Object System.Windows.Forms.Button
+$textModeButton.Text = "文字"
+$textModeButton.Width = 70
+$textModeButton.Height = 26
+
 $list = New-Object System.Windows.Forms.ListBox
 $list.Dock = "Fill"
 $list.Width = 520
@@ -547,6 +577,22 @@ $list.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawVariable
 $list.BorderStyle = "None"
 $list.BackColor = $ThemeBack
 $list.ForeColor = $ThemeText
+
+$imageGrid = New-Object System.Windows.Forms.ListView
+$imageGrid.Dock = "Fill"
+$imageGrid.View = [System.Windows.Forms.View]::LargeIcon
+$imageGrid.BorderStyle = "None"
+$imageGrid.BackColor = $ThemeBack
+$imageGrid.ForeColor = $ThemeText
+$imageGrid.HideSelection = $false
+$imageGrid.MultiSelect = $false
+$imageGrid.Visible = $false
+$imageGrid.TabStop = $true
+
+$imageGridImages = New-Object System.Windows.Forms.ImageList
+$imageGridImages.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
+$imageGridImages.ImageSize = New-Object System.Drawing.Size -ArgumentList 128, 128
+$imageGrid.LargeImageList = $imageGridImages
 
 $panel = New-Object System.Windows.Forms.Panel
 $panel.Dock = "Fill"
@@ -593,6 +639,9 @@ Set-ToolButtonStyle $copyButton $true
 Set-ToolButtonStyle $refreshButton $false
 Set-ToolButtonStyle $collapseButton $false
 Set-ToolButtonStyle $hideButton $false
+Set-ToolButtonStyle $allModeButton ($script:ViewMode -eq "all")
+Set-ToolButtonStyle $imageModeButton ($script:ViewMode -eq "image")
+Set-ToolButtonStyle $textModeButton ($script:ViewMode -eq "text")
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = "正在监听复制内容..."
@@ -637,11 +686,16 @@ $buttons.Controls.Add($refreshButton)
 $buttons.Controls.Add($collapseButton)
 $buttons.Controls.Add($hideButton)
 $buttons.Controls.Add($statusLabel)
+$viewBar.Controls.Add($allModeButton)
+$viewBar.Controls.Add($imageModeButton)
+$viewBar.Controls.Add($textModeButton)
 $previewHost.Controls.Add($picture)
 $panel.Controls.Add($previewText)
 $panel.Controls.Add($previewHost)
 $panel.Controls.Add($buttons)
 $leftPanel.Controls.Add($list)
+$leftPanel.Controls.Add($imageGrid)
+$leftPanel.Controls.Add($viewBar)
 $leftPanel.Controls.Add($searchBox)
 $form.Controls.Add($panel)
 $form.Controls.Add($splitter)
@@ -691,35 +745,200 @@ function Test-HistoryItemMatch($Item, [string]$Query) {
     return ($haystack.IndexOf($Query, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
 }
 
+function Test-HistoryItemModeMatch($Item) {
+    switch ($script:ViewMode) {
+        "image" { return ($Item.kind -eq "image") }
+        "text" { return ($Item.kind -eq "text" -or $Item.kind -eq "html" -or $Item.kind -eq "rtf") }
+        default { return $true }
+    }
+}
+
+function Get-ViewModeText {
+    switch ($script:ViewMode) {
+        "image" { return "图片" }
+        "text" { return "文字" }
+        default { return "全部" }
+    }
+}
+
+function Update-ModeButtons {
+    Set-ToolButtonStyle $allModeButton ($script:ViewMode -eq "all")
+    Set-ToolButtonStyle $imageModeButton ($script:ViewMode -eq "image")
+    Set-ToolButtonStyle $textModeButton ($script:ViewMode -eq "text")
+}
+
+function Get-GridThumbnail($Item, [int]$Size) {
+    $full = Join-Path $AppRoot ([string]$Item.imagePath)
+    if (-not (Test-Path -LiteralPath $full)) {
+        return $null
+    }
+
+    try {
+        $source = [System.Drawing.Image]::FromFile($full)
+        try {
+            $thumb = New-Object System.Drawing.Bitmap -ArgumentList $Size, $Size
+            $g = [System.Drawing.Graphics]::FromImage($thumb)
+            try {
+                $g.Clear([System.Drawing.Color]::FromArgb(24, 24, 24))
+                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $scale = [Math]::Min(($Size - 10) / $source.Width, ($Size - 10) / $source.Height)
+                $drawWidth = [int]($source.Width * $scale)
+                $drawHeight = [int]($source.Height * $scale)
+                $drawX = [int](($Size - $drawWidth) / 2)
+                $drawY = [int](($Size - $drawHeight) / 2)
+                $g.DrawImage($source, $drawX, $drawY, $drawWidth, $drawHeight)
+            }
+            finally {
+                $g.Dispose()
+            }
+            return $thumb
+        }
+        finally {
+            $source.Dispose()
+        }
+    }
+    catch {
+        Write-ErrorLog "图片网格缩略图生成失败。" $_
+        return $null
+    }
+}
+
+function Populate-ImageGrid([string]$SelectedId) {
+    $oldImageList = $imageGrid.LargeImageList
+    $newImageList = New-Object System.Windows.Forms.ImageList
+    $newImageList.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
+    $size = [int](Clamp-Value ([int](118 * $script:ListScale)) 72 210)
+    $newImageList.ImageSize = New-Object System.Drawing.Size -ArgumentList $size, $size
+
+    $imageGrid.BeginUpdate()
+    try {
+        $imageGrid.Items.Clear()
+        for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
+            $item = $script:DisplayItems[$i]
+            $thumb = Get-GridThumbnail $item $size
+            if ($null -eq $thumb) {
+                $thumb = New-Object System.Drawing.Bitmap -ArgumentList $size, $size
+            }
+            [void]$newImageList.Images.Add($thumb)
+            $thumb.Dispose()
+
+            $time = ([DateTime]::Parse($item.createdAt)).ToLocalTime().ToString("MM-dd HH:mm")
+            $text = $time + [Environment]::NewLine + $item.width + " x " + $item.height
+            $gridItem = New-Object System.Windows.Forms.ListViewItem -ArgumentList $text, $i
+            $gridItem.Tag = $i
+            [void]$imageGrid.Items.Add($gridItem)
+        }
+
+        $imageGrid.LargeImageList = $newImageList
+        if ($oldImageList) {
+            $oldImageList.Dispose()
+        }
+
+        if ($SelectedId) {
+            foreach ($gridItem in $imageGrid.Items) {
+                $idx = [int]$gridItem.Tag
+                if ([string]$script:DisplayItems[$idx].id -eq $SelectedId) {
+                    $gridItem.Selected = $true
+                    $gridItem.Focused = $true
+                    $gridItem.EnsureVisible()
+                    break
+                }
+            }
+        }
+
+        if ($imageGrid.SelectedItems.Count -eq 0 -and $imageGrid.Items.Count -gt 0) {
+            $imageGrid.Items[0].Selected = $true
+            $imageGrid.Items[0].Focused = $true
+        }
+    }
+    finally {
+        $imageGrid.EndUpdate()
+    }
+}
+
+function Populate-List([string]$SelectedId) {
+    $list.BeginUpdate()
+    try {
+        $list.Items.Clear()
+        foreach ($item in $script:DisplayItems) {
+            [void]$list.Items.Add((Get-ItemTitle $item))
+        }
+
+        if ($SelectedId) {
+            for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
+                if ([string]$script:DisplayItems[$i].id -eq $SelectedId) {
+                    $list.SelectedIndex = $i
+                    break
+                }
+            }
+        }
+
+        if ($list.SelectedIndex -lt 0 -and $list.Items.Count -gt 0) {
+            $list.SelectedIndex = 0
+        }
+    }
+    finally {
+        $list.EndUpdate()
+    }
+    $list.Invalidate()
+}
+
+function Get-SelectedDisplayIndex {
+    if ($script:ViewMode -eq "image" -and $imageGrid.Visible) {
+        if ($imageGrid.SelectedItems.Count -gt 0) {
+            return [int]$imageGrid.SelectedItems[0].Tag
+        }
+        return -1
+    }
+    return $list.SelectedIndex
+}
+
+function Get-SelectedHistoryItem {
+    $idx = Get-SelectedDisplayIndex
+    if ($idx -lt 0 -or $idx -ge $script:DisplayItems.Count) {
+        return $null
+    }
+    return $script:DisplayItems[$idx]
+}
+
 function Apply-Filter {
     $query = $searchBox.Text.Trim()
+    $selected = Get-SelectedHistoryItem
+    $selectedId = if ($selected) { [string]$selected.id } else { $null }
     $items = New-Object System.Collections.Generic.List[object]
     foreach ($item in $script:HistoryItems) {
-        if (Test-HistoryItemMatch $item $query) {
+        if ((Test-HistoryItemModeMatch $item) -and (Test-HistoryItemMatch $item $query)) {
             $items.Add($item)
         }
     }
 
     $script:DisplayItems = @($items.ToArray())
-    $list.Items.Clear()
-    foreach ($item in $script:DisplayItems) {
-        [void]$list.Items.Add((Get-ItemTitle $item))
-    }
+    $imageGrid.Visible = ($script:ViewMode -eq "image")
+    $list.Visible = -not $imageGrid.Visible
 
-    if ($list.Items.Count -gt 0) {
-        $list.SelectedIndex = 0
+    if ($imageGrid.Visible) {
+        Populate-ImageGrid $selectedId
     }
     else {
+        Populate-List $selectedId
+    }
+
+    if ($script:DisplayItems.Count -eq 0) {
         $previewText.Visible = $true
+        $previewHost.Visible = $false
         $picture.Visible = $false
         $previewText.Text = "没有匹配的历史记录。"
     }
+    else {
+        Show-Selected
+    }
 
+    $modeText = Get-ViewModeText
     if ([string]::IsNullOrWhiteSpace($query)) {
-        $statusLabel.Text = "共 " + $script:HistoryItems.Count + " 条，保留最近 3 天"
+        $statusLabel.Text = $modeText + "：共 " + $script:DisplayItems.Count + " 条，保留最近 3 天"
     }
     else {
-        $statusLabel.Text = "匹配 " + $script:DisplayItems.Count + " / " + $script:HistoryItems.Count + " 条"
+        $statusLabel.Text = $modeText + "：匹配 " + $script:DisplayItems.Count + " / " + $script:HistoryItems.Count + " 条"
     }
 }
 
@@ -730,35 +949,16 @@ function Refresh-List {
 }
 
 function Refresh-ListLayout {
-    $selectedId = $null
-    if ($list.SelectedIndex -ge 0 -and $list.SelectedIndex -lt $script:DisplayItems.Count) {
-        $selectedId = [string]$script:DisplayItems[$list.SelectedIndex].id
-    }
+    $selected = Get-SelectedHistoryItem
+    $selectedId = if ($selected) { [string]$selected.id } else { $null }
 
     Clear-ThumbnailCache
-    $list.BeginUpdate()
-    try {
-        $list.Items.Clear()
-        foreach ($item in $script:DisplayItems) {
-            [void]$list.Items.Add((Get-ItemTitle $item))
-        }
-
-        if ($selectedId) {
-            for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
-                if ([string]$script:DisplayItems[$i].id -eq $selectedId) {
-                    $list.SelectedIndex = $i
-                    break
-                }
-            }
-        }
-        elseif ($list.Items.Count -gt 0) {
-            $list.SelectedIndex = 0
-        }
+    if ($script:ViewMode -eq "image" -and $imageGrid.Visible) {
+        Populate-ImageGrid $selectedId
     }
-    finally {
-        $list.EndUpdate()
+    else {
+        Populate-List $selectedId
     }
-    $list.Invalidate()
 }
 
 function Adjust-LeftLayout([int]$WheelDelta) {
@@ -843,6 +1043,7 @@ function Draw-HistoryListItem($EventArgs) {
     $bodyBrush = New-Object System.Drawing.SolidBrush $bodyColor
     $mutedBrush = New-Object System.Drawing.SolidBrush $ThemeBlue
     $format = New-Object System.Drawing.StringFormat
+    $clipState = $null
 
     try {
         $format.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
@@ -851,6 +1052,8 @@ function Draw-HistoryListItem($EventArgs) {
         $card = New-Object System.Drawing.Rectangle -ArgumentList ($bounds.X + 4), ($bounds.Y + 4), ($bounds.Width - 8), ($bounds.Height - 8)
         $graphics.FillRectangle($backBrush, $card)
         $graphics.DrawRectangle($borderPen, $card)
+        $clipState = $graphics.Save()
+        $graphics.SetClip($card)
 
         $time = ([DateTime]::Parse($item.createdAt)).ToLocalTime().ToString("MM-dd HH:mm:ss")
         $kindText = switch ($item.kind) {
@@ -906,6 +1109,9 @@ function Draw-HistoryListItem($EventArgs) {
         }
     }
     finally {
+        if ($clipState) {
+            $graphics.Restore($clipState)
+        }
         $format.Dispose()
         $mutedBrush.Dispose()
         $bodyBrush.Dispose()
@@ -916,11 +1122,10 @@ function Draw-HistoryListItem($EventArgs) {
 }
 
 function Show-Selected {
-    $idx = $list.SelectedIndex
-    if ($idx -lt 0 -or $idx -ge $script:DisplayItems.Count) {
+    $item = Get-SelectedHistoryItem
+    if ($null -eq $item) {
         return
     }
-    $item = $script:DisplayItems[$idx]
     $picture.Visible = $false
     $previewHost.Visible = $false
     $previewText.Visible = $true
@@ -938,10 +1143,10 @@ function Show-Selected {
             finally {
                 $img.Dispose()
             }
-            Update-PreviewZoom
             $previewText.Visible = $false
             $previewHost.Visible = $true
             $picture.Visible = $true
+            Update-PreviewZoom
         }
         else {
             $previewText.Text = "图片文件已经不存在。"
@@ -955,6 +1160,94 @@ function Show-Selected {
         $previewHost.Visible = $false
         $previewText.Text = [string]$item.text
     }
+}
+
+function Start-HistoryDrag($Item, $Control) {
+    if ($null -eq $Item -or $null -eq $Control) {
+        return
+    }
+
+    $data = New-Object System.Windows.Forms.DataObject
+    $dragImage = $null
+
+    try {
+        switch ($Item.kind) {
+            "image" {
+                $full = Join-Path $AppRoot ([string]$Item.imagePath)
+                if (-not (Test-Path -LiteralPath $full)) {
+                    return
+                }
+
+                $files = New-Object System.Collections.Specialized.StringCollection
+                [void]$files.Add($full)
+                $data.SetFileDropList($files)
+
+                $source = [System.Drawing.Image]::FromFile($full)
+                try {
+                    $dragImage = New-Object System.Drawing.Bitmap $source
+                    $data.SetImage($dragImage)
+                }
+                finally {
+                    $source.Dispose()
+                }
+            }
+            "files" {
+                $files = New-Object System.Collections.Specialized.StringCollection
+                foreach ($path in $Item.paths) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+                        [void]$files.Add([string]$path)
+                    }
+                }
+                if ($files.Count -eq 0) {
+                    return
+                }
+                $data.SetFileDropList($files)
+            }
+            default {
+                $text = [string]$Item.text
+                if ([string]::IsNullOrEmpty($text)) {
+                    $text = [string]$Item.preview
+                }
+                if ([string]::IsNullOrEmpty($text)) {
+                    return
+                }
+                $data.SetText($text, [System.Windows.Forms.TextDataFormat]::UnicodeText)
+                $data.SetText($text)
+            }
+        }
+
+        [void]$Control.DoDragDrop($data, [System.Windows.Forms.DragDropEffects]::Copy)
+    }
+    catch {
+        Write-ErrorLog "拖拽复制失败。" $_
+        $statusLabel.Text = "拖拽复制失败，可以先点复制回剪贴板"
+    }
+    finally {
+        if ($dragImage) {
+            $dragImage.Dispose()
+        }
+    }
+}
+
+function Test-DragDistance {
+    if ($null -eq $script:DragItem) {
+        return $false
+    }
+
+    $current = [System.Windows.Forms.Control]::MousePosition
+    $dx = [Math]::Abs($current.X - $script:DragStartPoint.X)
+    $dy = [Math]::Abs($current.Y - $script:DragStartPoint.Y)
+    return ($dx -ge 5 -or $dy -ge 5)
+}
+
+function Begin-DragCandidate($Item) {
+    $script:DragItem = $Item
+    $script:DragStartPoint = [System.Windows.Forms.Control]::MousePosition
+}
+
+function Clear-DragCandidate {
+    $script:DragItem = $null
+    $script:DragStartPoint = [System.Drawing.Point]::Empty
 }
 
 function Save-ExpandedBounds {
@@ -1092,7 +1385,8 @@ function Show-HistoryPanel {
     $bubblePicture.Visible = $false
     $leftPanel.Visible = $true
     $splitter.Visible = $true
-    $list.Visible = $true
+    $imageGrid.Visible = ($script:ViewMode -eq "image")
+    $list.Visible = -not $imageGrid.Visible
     $panel.Visible = $true
     $form.ResumeLayout($true)
 
@@ -1125,6 +1419,8 @@ function Exit-App {
 
 $list.Add_SelectedIndexChanged({ Show-Selected })
 
+$imageGrid.Add_SelectedIndexChanged({ Show-Selected })
+
 $list.Add_MeasureItem({
     param($sender, $e)
     if ($e.Index -ge 0 -and $e.Index -lt $script:DisplayItems.Count) {
@@ -1140,8 +1436,115 @@ $list.Add_DrawItem({
     Draw-HistoryListItem $e
 })
 
+$list.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) {
+        return
+    }
+
+    $idx = $list.IndexFromPoint($e.Location)
+    if ($idx -ge 0 -and $idx -lt $script:DisplayItems.Count) {
+        $list.SelectedIndex = $idx
+        Begin-DragCandidate $script:DisplayItems[$idx]
+    }
+})
+
+$list.Add_MouseMove({
+    param($sender, $e)
+    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -ne 0 -and (Test-DragDistance)) {
+        $item = $script:DragItem
+        Clear-DragCandidate
+        Start-HistoryDrag $item $list
+    }
+})
+
+$list.Add_MouseUp({ Clear-DragCandidate })
+
+$imageGrid.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) {
+        return
+    }
+
+    $gridItem = $imageGrid.GetItemAt($e.X, $e.Y)
+    if ($null -ne $gridItem) {
+        $gridItem.Selected = $true
+        $gridItem.Focused = $true
+        $idx = [int]$gridItem.Tag
+        if ($idx -ge 0 -and $idx -lt $script:DisplayItems.Count) {
+            Begin-DragCandidate $script:DisplayItems[$idx]
+        }
+    }
+})
+
+$imageGrid.Add_MouseMove({
+    param($sender, $e)
+    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -ne 0 -and (Test-DragDistance)) {
+        $item = $script:DragItem
+        Clear-DragCandidate
+        Start-HistoryDrag $item $imageGrid
+    }
+})
+
+$imageGrid.Add_MouseUp({ Clear-DragCandidate })
+
+$previewText.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        Begin-DragCandidate (Get-SelectedHistoryItem)
+    }
+})
+
+$previewText.Add_MouseMove({
+    param($sender, $e)
+    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -ne 0 -and (Test-DragDistance)) {
+        $item = $script:DragItem
+        Clear-DragCandidate
+        Start-HistoryDrag $item $previewText
+    }
+})
+
+$previewText.Add_MouseUp({ Clear-DragCandidate })
+
+$picture.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        Begin-DragCandidate (Get-SelectedHistoryItem)
+    }
+})
+
+$picture.Add_MouseMove({
+    param($sender, $e)
+    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -ne 0 -and (Test-DragDistance)) {
+        $item = $script:DragItem
+        Clear-DragCandidate
+        Start-HistoryDrag $item $picture
+    }
+})
+
+$picture.Add_MouseUp({ Clear-DragCandidate })
+
+$previewHost.Add_MouseDown({
+    param($sender, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+        Begin-DragCandidate (Get-SelectedHistoryItem)
+    }
+})
+
+$previewHost.Add_MouseMove({
+    param($sender, $e)
+    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -ne 0 -and (Test-DragDistance)) {
+        $item = $script:DragItem
+        Clear-DragCandidate
+        Start-HistoryDrag $item $previewHost
+    }
+})
+
+$previewHost.Add_MouseUp({ Clear-DragCandidate })
+
 $leftPanel.Add_MouseEnter({ $leftPanel.Focus() })
 $list.Add_MouseEnter({ $list.Focus() })
+$imageGrid.Add_MouseEnter({ $imageGrid.Focus() })
 $searchBox.Add_MouseEnter({ $searchBox.Focus() })
 $previewHost.Add_MouseEnter({ $previewHost.Focus() })
 $picture.Add_MouseEnter({ $previewHost.Focus() })
@@ -1154,6 +1557,13 @@ $leftPanel.Add_MouseWheel({
 })
 
 $list.Add_MouseWheel({
+    param($sender, $e)
+    if (([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Control) -ne 0) {
+        Adjust-LeftLayout $e.Delta
+    }
+})
+
+$imageGrid.Add_MouseWheel({
     param($sender, $e)
     if (([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Control) -ne 0) {
         Adjust-LeftLayout $e.Delta
@@ -1184,18 +1594,42 @@ $picture.Add_MouseWheel({
 $previewHost.Add_Resize({ Update-PreviewZoom })
 
 $copyButton.Add_Click({
-    $idx = $list.SelectedIndex
-    if ($idx -lt 0 -or $idx -ge $script:DisplayItems.Count) {
+    $item = Get-SelectedHistoryItem
+    if ($null -eq $item) {
         [System.Windows.Forms.MessageBox]::Show("请先在左侧选一条历史记录。", "历史粘贴板") | Out-Null
         return
     }
-    Set-ClipboardFromItem $script:DisplayItems[$idx]
+    Set-ClipboardFromItem $item
     $statusLabel.Text = "已复制回剪贴板"
 })
 
 $refreshButton.Add_Click({ Refresh-List; Show-Selected })
 
 $searchBox.Add_TextChanged({ Apply-Filter })
+
+$allModeButton.Add_Click({
+    $script:ViewMode = "all"
+    $script:Settings.viewMode = $script:ViewMode
+    Update-ModeButtons
+    Write-Settings
+    Apply-Filter
+})
+
+$imageModeButton.Add_Click({
+    $script:ViewMode = "image"
+    $script:Settings.viewMode = $script:ViewMode
+    Update-ModeButtons
+    Write-Settings
+    Apply-Filter
+})
+
+$textModeButton.Add_Click({
+    $script:ViewMode = "text"
+    $script:Settings.viewMode = $script:ViewMode
+    Update-ModeButtons
+    Write-Settings
+    Apply-Filter
+})
 
 $collapseButton.Add_Click({ Show-Bubble })
 
@@ -1301,7 +1735,7 @@ $timer.Add_Tick({
         $script:LastHash = $snapshot.Hash
         if (Add-HistoryItem $snapshot) {
             Refresh-List
-            if ($list.Items.Count -gt 0) {
+            if ($list.Visible -and $list.Items.Count -gt 0) {
                 $list.SelectedIndex = 0
             }
             $statusLabel.Text = "刚刚保存了一条复制内容"
