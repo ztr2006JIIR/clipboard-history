@@ -809,6 +809,10 @@ function Populate-ImageGrid([string]$SelectedId) {
     $newImageList.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
     $size = [int](Clamp-Value ([int](118 * $script:ListScale)) 72 210)
     $newImageList.ImageSize = New-Object System.Drawing.Size -ArgumentList $size, $size
+    $imageGrid.LargeImageList = $newImageList
+    if ($oldImageList -and -not [object]::ReferenceEquals($oldImageList, $newImageList)) {
+        $oldImageList.Dispose()
+    }
 
     $imageGrid.BeginUpdate()
     try {
@@ -820,18 +824,12 @@ function Populate-ImageGrid([string]$SelectedId) {
                 $thumb = New-Object System.Drawing.Bitmap -ArgumentList $size, $size
             }
             [void]$newImageList.Images.Add($thumb)
-            $thumb.Dispose()
 
             $time = ([DateTime]::Parse($item.createdAt)).ToLocalTime().ToString("MM-dd HH:mm")
             $text = $time + [Environment]::NewLine + $item.width + " x " + $item.height
             $gridItem = New-Object System.Windows.Forms.ListViewItem -ArgumentList $text, $i
             $gridItem.Tag = $i
             [void]$imageGrid.Items.Add($gridItem)
-        }
-
-        $imageGrid.LargeImageList = $newImageList
-        if ($oldImageList) {
-            $oldImageList.Dispose()
         }
 
         if ($SelectedId) {
