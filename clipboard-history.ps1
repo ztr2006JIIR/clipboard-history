@@ -1,6 +1,262 @@
 ﻿Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public sealed class CtrlDoubleTapHook : IDisposable
+{
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_SYSKEYUP = 0x0105;
+    private const int VK_CONTROL = 0x11;
+    private const int VK_LCONTROL = 0xA2;
+    private const int VK_RCONTROL = 0xA3;
+    private const int DoubleTapMilliseconds = 500;
+
+    private readonly LowLevelKeyboardProc callback;
+    private IntPtr hookId = IntPtr.Zero;
+    private bool leftCtrlDown;
+    private bool rightCtrlDown;
+    private bool ctrlUsedWithAnotherKey;
+    private long firstTapAt;
+    private int doubleTapPending;
+
+    public CtrlDoubleTapHook()
+    {
+        callback = HookCallback;
+        using (Process process = Process.GetCurrentProcess())
+        using (ProcessModule module = process.MainModule)
+        {
+            hookId = SetWindowsHookEx(
+                WH_KEYBOARD_LL,
+                callback,
+                GetModuleHandle(module.ModuleName),
+                0);
+        }
+
+        if (hookId == IntPtr.Zero)
+        {
+            throw new System.ComponentModel.Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "无法安装全局 Ctrl 双击监听。");
+        }
+    }
+
+    private static bool IsControlKey(int vkCode)
+    {
+        return vkCode == VK_CONTROL || vkCode == VK_LCONTROL || vkCode == VK_RCONTROL;
+    }
+
+    private IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int message = wParam.ToInt32();
+            int vkCode = Marshal.ReadInt32(lParam);
+            bool isKeyDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+            bool isKeyUp = message == WM_KEYUP || message == WM_SYSKEYUP;
+
+            if (IsControlKey(vkCode))
+            {
+                if (isKeyDown)
+                {
+                    bool wasAnyCtrlDown = leftCtrlDown || rightCtrlDown;
+                    if (vkCode == VK_RCONTROL)
+                        rightCtrlDown = true;
+                    else
+                        leftCtrlDown = true;
+
+                    if (!wasAnyCtrlDown)
+                        ctrlUsedWithAnotherKey = false;
+                }
+                else if (isKeyUp)
+                {
+                    if (vkCode == VK_RCONTROL)
+                        rightCtrlDown = false;
+                    else
+                        leftCtrlDown = false;
+
+                    if (!leftCtrlDown && !rightCtrlDown)
+                    {
+                        if (!ctrlUsedWithAnotherKey)
+                            RegisterPureCtrlTap();
+                        else
+                            firstTapAt = 0;
+                    }
+                }
+            }
+            else if (isKeyDown && (leftCtrlDown || rightCtrlDown))
+            {
+                ctrlUsedWithAnotherKey = true;
+                firstTapAt = 0;
+            }
+        }
+
+        return CallNextHookEx(hookId, nCode, wParam, lParam);
+    }
+
+    private void RegisterPureCtrlTap()
+    {
+        long now = DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond;
+        if (firstTapAt != 0 && now - firstTapAt <= DoubleTapMilliseconds)
+        {
+            firstTapAt = 0;
+            Interlocked.Exchange(ref doubleTapPending, 1);
+        }
+        else
+        {
+            firstTapAt = now;
+        }
+    }
+
+    public bool ConsumeDoubleTap()
+    {
+        return Interlocked.Exchange(ref doubleTapPending, 0) == 1;
+    }
+
+    public void Dispose()
+    {
+        if (hookId != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(hookId);
+            hookId = IntPtr.Zero;
+        }
+        GC.SuppressFinalize(this);
+    }
+
+    ~CtrlDoubleTapHook()
+    {
+        Dispose();
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(
+        int idHook,
+        LowLevelKeyboardProc lpfn,
+        IntPtr hMod,
+        uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(
+        IntPtr hhk,
+        int nCode,
+        IntPtr wParam,
+        IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+}
+
+[ComImport]
+[Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IVirtualDesktopManager
+{
+    [PreserveSig]
+    int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.Bool)] out bool onCurrentDesktop);
+
+    [PreserveSig]
+    int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+
+    [PreserveSig]
+    int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
+}
+
+public static class VirtualDesktopWindowMover
+{
+    private static readonly Guid ManagerClassId = new Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A");
+
+    public static void MoveToCurrentDesktop(IntPtr targetWindow)
+    {
+        object instance = null;
+        try
+        {
+            Type managerType = Type.GetTypeFromCLSID(ManagerClassId, true);
+            instance = Activator.CreateInstance(managerType);
+            IVirtualDesktopManager manager = (IVirtualDesktopManager)instance;
+
+            Guid desktopId;
+            if (!TryGetCurrentDesktopId(manager, targetWindow, out desktopId))
+                throw new InvalidOperationException("找不到当前虚拟桌面上的参考窗口。");
+
+            int moveResult = manager.MoveWindowToDesktop(targetWindow, ref desktopId);
+            if (moveResult != 0)
+                Marshal.ThrowExceptionForHR(moveResult);
+        }
+        finally
+        {
+            if (instance != null && Marshal.IsComObject(instance))
+                Marshal.FinalReleaseComObject(instance);
+        }
+    }
+
+    private static bool TryGetCurrentDesktopId(
+        IVirtualDesktopManager manager,
+        IntPtr targetWindow,
+        out Guid desktopId)
+    {
+        desktopId = Guid.Empty;
+        IntPtr foreground = GetForegroundWindow();
+        if (foreground != IntPtr.Zero && foreground != targetWindow)
+        {
+            bool onCurrentDesktop;
+            if (manager.IsWindowOnCurrentVirtualDesktop(foreground, out onCurrentDesktop) == 0 &&
+                onCurrentDesktop &&
+                manager.GetWindowDesktopId(foreground, out desktopId) == 0)
+            {
+                return true;
+            }
+        }
+
+        Guid foundDesktopId = Guid.Empty;
+        EnumWindows(delegate(IntPtr candidate, IntPtr parameter)
+        {
+            if (candidate == targetWindow || !IsWindowVisible(candidate))
+                return true;
+
+            bool onCurrentDesktop;
+            Guid candidateDesktopId;
+            if (manager.IsWindowOnCurrentVirtualDesktop(candidate, out onCurrentDesktop) == 0 &&
+                onCurrentDesktop &&
+                manager.GetWindowDesktopId(candidate, out candidateDesktopId) == 0)
+            {
+                foundDesktopId = candidateDesktopId;
+                return false;
+            }
+            return true;
+        }, IntPtr.Zero);
+
+        desktopId = foundDesktopId;
+        return desktopId != Guid.Empty;
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+}
+"@
+
 $ErrorActionPreference = "Stop"
 
 $AppRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -14,14 +270,16 @@ $SettingsFile = Join-Path $DataDir "settings.json"
 $RetentionDays = 3
 $BubbleSize = 72
 $TransparentColor = [System.Drawing.Color]::FromArgb(255, 1, 2, 3)
-$ThemeBack = [System.Drawing.Color]::FromArgb(10, 14, 22)
-$ThemePanel = [System.Drawing.Color]::FromArgb(15, 22, 34)
-$ThemeCard = [System.Drawing.Color]::FromArgb(20, 30, 46)
-$ThemeCardSelected = [System.Drawing.Color]::FromArgb(24, 70, 124)
-$ThemeBorder = [System.Drawing.Color]::FromArgb(43, 60, 82)
-$ThemeBlue = [System.Drawing.Color]::FromArgb(63, 150, 255)
-$ThemeText = [System.Drawing.Color]::FromArgb(236, 244, 255)
-$ThemeMuted = [System.Drawing.Color]::FromArgb(145, 164, 190)
+$ThemeBack = [System.Drawing.Color]::FromArgb(15, 19, 28)
+$ThemePanel = [System.Drawing.Color]::FromArgb(23, 29, 42)
+$ThemeCard = [System.Drawing.Color]::FromArgb(27, 35, 49)
+$ThemeCardSelected = [System.Drawing.Color]::FromArgb(30, 62, 99)
+$ThemeBorder = [System.Drawing.Color]::FromArgb(42, 53, 70)
+$ThemeBorderSoft = [System.Drawing.Color]::FromArgb(33, 43, 58)
+$ThemeBlue = [System.Drawing.Color]::FromArgb(88, 166, 255)
+$ThemeBlueHover = [System.Drawing.Color]::FromArgb(110, 181, 255)
+$ThemeText = [System.Drawing.Color]::FromArgb(240, 245, 252)
+$ThemeMuted = [System.Drawing.Color]::FromArgb(151, 165, 186)
 
 New-Item -ItemType Directory -Force -Path $DataDir, $ImageDir | Out-Null
 
@@ -51,6 +309,54 @@ function Write-ErrorLog($Message, $ErrorRecord) {
     }
     catch {
         # Logging must never interrupt clipboard monitoring.
+    }
+}
+
+function New-RoundedRectanglePath([System.Drawing.Rectangle]$Rectangle, [int]$Radius) {
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $diameter = [Math]::Max(2, $Radius * 2)
+    $arc = New-Object System.Drawing.Rectangle -ArgumentList $Rectangle.X, $Rectangle.Y, $diameter, $diameter
+    $path.AddArc($arc, 180, 90)
+    $arc.X = $Rectangle.Right - $diameter
+    $path.AddArc($arc, 270, 90)
+    $arc.Y = $Rectangle.Bottom - $diameter
+    $path.AddArc($arc, 0, 90)
+    $arc.X = $Rectangle.X
+    $path.AddArc($arc, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+function Set-RoundedControlRegion($Control, [int]$Radius) {
+    if ($null -eq $Control -or $Control.Width -le 0 -or $Control.Height -le 0) {
+        return
+    }
+    $bounds = New-Object System.Drawing.Rectangle -ArgumentList 0, 0, ($Control.Width - 1), ($Control.Height - 1)
+    $path = New-RoundedRectanglePath $bounds $Radius
+    try {
+        $oldRegion = $Control.Region
+        $Control.Region = New-Object System.Drawing.Region $path
+        if ($oldRegion) { $oldRegion.Dispose() }
+    }
+    finally {
+        $path.Dispose()
+    }
+}
+
+function Enable-SmoothPainting($Control) {
+    if ($null -eq $Control) {
+        return
+    }
+
+    try {
+        $flags = [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic
+        $property = $Control.GetType().GetProperty("DoubleBuffered", $flags)
+        if ($property) {
+            $property.SetValue($Control, $true, $null)
+        }
+    }
+    catch {
+        Write-ErrorLog "界面双缓冲启用失败。" $_
     }
 }
 
@@ -86,6 +392,7 @@ function Get-DefaultSettings {
         expandedHeight = 650
         leftPanelWidth = 540
         listScale = 1.0
+        imageColumns = 0
         previewZoom = 1.0
         viewMode = "all"
     }
@@ -402,15 +709,56 @@ function Get-ItemTitle($Item) {
     return "$localTime $prefix $preview"
 }
 
+function Set-ClipboardDataObjectReliable(
+    [System.Windows.Forms.DataObject]$Data,
+    [string]$RequiredFormat,
+    [int]$ExpectedCount
+) {
+    try {
+        [System.Windows.Forms.Clipboard]::SetDataObject($Data, $true, 10, 80)
+        Start-Sleep -Milliseconds 60
+        switch ($RequiredFormat) {
+            "FileDrop" {
+                if (-not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
+                    return $false
+                }
+                return ([System.Windows.Forms.Clipboard]::GetFileDropList().Count -ge $ExpectedCount)
+            }
+            "Bitmap" {
+                return [System.Windows.Forms.Clipboard]::ContainsImage()
+            }
+            default {
+                return [System.Windows.Forms.Clipboard]::ContainsText([System.Windows.Forms.TextDataFormat]::UnicodeText)
+            }
+        }
+    }
+    catch {
+        Write-ErrorLog "写入剪贴板失败。" $_
+        return $false
+    }
+}
+
+function Add-ClipboardCopyEffect([System.Windows.Forms.DataObject]$Data) {
+    $effectBytes = [byte[]](1, 0, 0, 0)
+    $effectStream = New-Object System.IO.MemoryStream -ArgumentList (,$effectBytes)
+    $Data.SetData("Preferred DropEffect", $false, $effectStream)
+    return $effectStream
+}
+
 function Set-ClipboardFromItem($Item) {
     switch ($Item.kind) {
         "image" {
             $full = Join-Path $AppRoot ([string]$Item.imagePath)
             if (Test-Path -LiteralPath $full) {
                 $img = [System.Drawing.Image]::FromFile($full)
+                $bmp = $null
                 try {
                     $bmp = New-Object System.Drawing.Bitmap $img
-                    [System.Windows.Forms.Clipboard]::SetImage($bmp)
+                    $data = New-Object System.Windows.Forms.DataObject
+                    $data.SetImage($bmp)
+                    if (Set-ClipboardDataObjectReliable $data "Bitmap" 1) {
+                        return 1
+                    }
                 }
                 finally {
                     $img.Dispose()
@@ -419,18 +767,89 @@ function Set-ClipboardFromItem($Item) {
                     }
                 }
             }
+            return 0
         }
         "files" {
             $collection = New-Object System.Collections.Specialized.StringCollection
             foreach ($path in $Item.paths) {
-                [void]$collection.Add([string]$path)
+                if (Test-Path -LiteralPath ([string]$path)) {
+                    [void]$collection.Add([string]$path)
+                }
             }
-            [System.Windows.Forms.Clipboard]::SetFileDropList($collection)
+            if ($collection.Count -eq 0) {
+                return 0
+            }
+            $data = New-Object System.Windows.Forms.DataObject
+            $effectStream = $null
+            try {
+                $data.SetFileDropList($collection)
+                $effectStream = Add-ClipboardCopyEffect $data
+                if (Set-ClipboardDataObjectReliable $data "FileDrop" $collection.Count) {
+                    return $collection.Count
+                }
+            }
+            finally {
+                if ($effectStream) { $effectStream.Dispose() }
+            }
+            return 0
         }
         default {
-            [System.Windows.Forms.Clipboard]::SetText([string]$Item.text)
+            $text = [string]$Item.text
+            if ([string]::IsNullOrEmpty($text)) {
+                return 0
+            }
+            $data = New-Object System.Windows.Forms.DataObject
+            $data.SetText($text, [System.Windows.Forms.TextDataFormat]::UnicodeText)
+            $data.SetText($text)
+            if (Set-ClipboardDataObjectReliable $data "UnicodeText" 1) {
+                return 1
+            }
+            return 0
         }
     }
+}
+
+function Set-ClipboardFromItems($Items) {
+    $selectedItems = @($Items | Where-Object { $null -ne $_ })
+    if ($selectedItems.Count -eq 0) {
+        return 0
+    }
+
+    if ($selectedItems.Count -eq 1) {
+        return (Set-ClipboardFromItem $selectedItems[0])
+    }
+
+    $imageItems = @($selectedItems | Where-Object { $_.kind -eq "image" })
+    if ($imageItems.Count -ne $selectedItems.Count) {
+        Set-ClipboardFromItem $selectedItems[0]
+        return 1
+    }
+
+    $files = New-Object System.Collections.Specialized.StringCollection
+    foreach ($item in $imageItems) {
+        $full = Join-Path $AppRoot ([string]$item.imagePath)
+        if (Test-Path -LiteralPath $full) {
+            [void]$files.Add($full)
+        }
+    }
+
+    if ($files.Count -eq 0) {
+        return 0
+    }
+
+    $data = New-Object System.Windows.Forms.DataObject
+    $effectStream = $null
+    try {
+        $data.SetFileDropList($files)
+        $effectStream = Add-ClipboardCopyEffect $data
+        if (Set-ClipboardDataObjectReliable $data "FileDrop" $files.Count) {
+            return $files.Count
+        }
+    }
+    finally {
+        if ($effectStream) { $effectStream.Dispose() }
+    }
+    return 0
 }
 
 function Clear-ThumbnailCache {
@@ -440,6 +859,23 @@ function Clear-ThumbnailCache {
         }
     }
     $script:ThumbnailCache.Clear()
+}
+
+function Prune-ThumbnailCache {
+    $staleKeys = New-Object System.Collections.Generic.List[string]
+    foreach ($key in $script:ThumbnailCache.Keys) {
+        if (-not (Test-Path -LiteralPath $key)) {
+            $staleKeys.Add([string]$key)
+        }
+    }
+
+    foreach ($key in $staleKeys) {
+        $thumb = $script:ThumbnailCache[$key]
+        if ($thumb) {
+            $thumb.Dispose()
+        }
+        $script:ThumbnailCache.Remove($key)
+    }
 }
 
 function Get-Thumbnail([string]$RelativePath) {
@@ -500,9 +936,16 @@ $script:BubbleMouseDown = $false
 $script:BubbleMouseDownPoint = [System.Drawing.Point]::Empty
 $script:BubbleStartLocation = [System.Drawing.Point]::Empty
 $script:AllowExit = $false
+$script:LastNonMinimizedWindowState = [System.Windows.Forms.FormWindowState]::Normal
+$script:IsNormalizingSplitLayout = $false
 $script:ThumbnailCache = @{}
 $script:DisplayItems = @()
 $script:ListScale = [double]$script:Settings.listScale
+$script:ImageColumns = [int]$script:Settings.imageColumns
+if ($script:ImageColumns -lt 1) {
+    $script:ImageColumns = [int](Clamp-Value ([Math]::Round(4 / [Math]::Max(0.75, $script:ListScale))) 1 6)
+    $script:Settings.imageColumns = $script:ImageColumns
+}
 $script:PreviewZoom = [double]$script:Settings.previewZoom
 $script:ViewMode = [string]$script:Settings.viewMode
 if (@("all", "image", "text") -notcontains $script:ViewMode) {
@@ -511,6 +954,32 @@ if (@("all", "image", "text") -notcontains $script:ViewMode) {
 }
 $script:DragStartPoint = [System.Drawing.Point]::Empty
 $script:DragItem = $null
+$script:ImageSelectedIndices = New-Object 'System.Collections.Generic.HashSet[int]'
+$script:ImageSelectionAnchor = -1
+$script:ImageRubberStart = [System.Drawing.Point]::Empty
+$script:ImageRubberRect = [System.Drawing.Rectangle]::Empty
+$script:ImageRubberBaseSelection = @()
+$script:IsImageRubberSelecting = $false
+$script:ImageWheelAccumulator = 0
+$script:UiDirty = $true
+$script:SuppressPreviewRefresh = $false
+$script:GridThumbnailCache = @{}
+$script:GridThumbnailQueue = New-Object System.Collections.Generic.Queue[int]
+$script:GridThumbnailPending = New-Object 'System.Collections.Generic.HashSet[int]'
+$script:LastImageGridScrollAt = [DateTime]::MinValue
+$script:DrawCardBrush = New-Object System.Drawing.SolidBrush $ThemeCard
+$script:DrawSelectedCardBrush = New-Object System.Drawing.SolidBrush $ThemeCardSelected
+$script:DrawBorderPen = New-Object System.Drawing.Pen $ThemeBorderSoft
+$script:DrawSelectedBorderPen = New-Object System.Drawing.Pen $ThemeBlue
+$script:DrawBorderPen.Width = 1
+$script:DrawSelectedBorderPen.Width = 1.4
+$script:DrawTitleBrush = New-Object System.Drawing.SolidBrush $ThemeText
+$script:DrawBodyBrush = New-Object System.Drawing.SolidBrush $ThemeMuted
+$script:DrawAccentBrush = New-Object System.Drawing.SolidBrush $ThemeBlue
+$script:DrawMissingBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(36, 43, 55))
+$script:DrawTextFormat = New-Object System.Drawing.StringFormat
+$script:DrawTextFormat.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
+$script:DrawTextFormat.FormatFlags = [System.Drawing.StringFormatFlags]::LineLimit
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "历史粘贴板 - 自动保存 3 天"
@@ -518,10 +987,13 @@ $form.Width = [int]$script:Settings.expandedWidth
 $form.Height = [int]$script:Settings.expandedHeight
 $form.StartPosition = "Manual"
 $form.Location = New-Object System.Drawing.Point -ArgumentList ([int]$script:Settings.expandedX), ([int]$script:Settings.expandedY)
-$form.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
+$form.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.TopMost = $true
+$form.KeyPreview = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = $ThemeBack
+$form.MinimumSize = New-Object System.Drawing.Size -ArgumentList 760, 480
+Enable-SmoothPainting $form
 
 $leftPanel = New-Object System.Windows.Forms.Panel
 $leftPanel.Dock = "Left"
@@ -529,110 +1001,117 @@ $leftPanel.Width = [int]$script:Settings.leftPanelWidth
 $leftPanel.Padding = New-Object System.Windows.Forms.Padding(12)
 $leftPanel.BackColor = $ThemeBack
 $leftPanel.TabStop = $true
+Enable-SmoothPainting $leftPanel
 
 $splitter = New-Object System.Windows.Forms.Splitter
 $splitter.Dock = "Left"
-$splitter.Width = 8
+$splitter.Width = 10
 $splitter.MinSize = 260
 $splitter.MinExtra = 320
-$splitter.BackColor = $ThemeBorder
+$splitter.BackColor = $ThemeBack
 $splitter.Cursor = [System.Windows.Forms.Cursors]::VSplit
 
+$searchHost = New-Object System.Windows.Forms.Panel
+$searchHost.Dock = "Top"
+$searchHost.Height = 42
+$searchHost.Padding = New-Object System.Windows.Forms.Padding(13, 8, 13, 7)
+$searchHost.BackColor = $ThemeBack
+Enable-SmoothPainting $searchHost
+
 $searchBox = New-Object System.Windows.Forms.TextBox
-$searchBox.Dock = "Top"
-$searchBox.Height = 32
-$searchBox.BorderStyle = "FixedSingle"
-$searchBox.BackColor = [System.Drawing.Color]::FromArgb(22, 32, 48)
+$searchBox.Dock = "Fill"
+$searchBox.BorderStyle = "None"
+$searchBox.BackColor = $ThemePanel
 $searchBox.ForeColor = $ThemeText
 $searchBox.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
 
 $viewBar = New-Object System.Windows.Forms.FlowLayoutPanel
 $viewBar.Dock = "Top"
-$viewBar.Height = 40
+$viewBar.Height = 50
 $viewBar.FlowDirection = "LeftToRight"
 $viewBar.BackColor = $ThemeBack
-$viewBar.Padding = New-Object System.Windows.Forms.Padding(0, 8, 0, 0)
+$viewBar.Padding = New-Object System.Windows.Forms.Padding(0, 12, 0, 0)
+Enable-SmoothPainting $viewBar
 
 $allModeButton = New-Object System.Windows.Forms.Button
-$allModeButton.Text = "全部"
-$allModeButton.Width = 70
-$allModeButton.Height = 26
+$allModeButton.Text = "▦  全部"
+$allModeButton.Width = 88
+$allModeButton.Height = 32
 
 $imageModeButton = New-Object System.Windows.Forms.Button
-$imageModeButton.Text = "图片"
-$imageModeButton.Width = 70
-$imageModeButton.Height = 26
+$imageModeButton.Text = "▣  图片"
+$imageModeButton.Width = 88
+$imageModeButton.Height = 32
 
 $textModeButton = New-Object System.Windows.Forms.Button
-$textModeButton.Text = "文字"
-$textModeButton.Width = 70
-$textModeButton.Height = 26
+$textModeButton.Text = "▤  文字"
+$textModeButton.Width = 88
+$textModeButton.Height = 32
 
 $list = New-Object System.Windows.Forms.ListBox
 $list.Dock = "Fill"
-$list.Width = 520
 $list.HorizontalScrollbar = $false
 $list.IntegralHeight = $false
 $list.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawVariable
 $list.BorderStyle = "None"
 $list.BackColor = $ThemeBack
 $list.ForeColor = $ThemeText
+Enable-SmoothPainting $list
 
-$imageGrid = New-Object System.Windows.Forms.ListView
+$imageGrid = New-Object System.Windows.Forms.Panel
 $imageGrid.Dock = "Fill"
-$imageGrid.View = [System.Windows.Forms.View]::LargeIcon
-$imageGrid.BorderStyle = "None"
 $imageGrid.BackColor = $ThemeBack
-$imageGrid.ForeColor = $ThemeText
-$imageGrid.HideSelection = $false
-$imageGrid.MultiSelect = $false
+$imageGrid.AutoScroll = $true
 $imageGrid.Visible = $false
 $imageGrid.TabStop = $true
-
-$imageGridImages = New-Object System.Windows.Forms.ImageList
-$imageGridImages.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
-$imageGridImages.ImageSize = New-Object System.Drawing.Size -ArgumentList 128, 128
-$imageGrid.LargeImageList = $imageGridImages
+Enable-SmoothPainting $imageGrid
 
 $panel = New-Object System.Windows.Forms.Panel
 $panel.Dock = "Fill"
 $panel.Padding = New-Object System.Windows.Forms.Padding(12)
 $panel.BackColor = $ThemeBack
+Enable-SmoothPainting $panel
 
 $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
 $buttons.Dock = "Top"
-$buttons.Height = 46
+$buttons.Height = 52
 $buttons.FlowDirection = "LeftToRight"
 $buttons.BackColor = $ThemeBack
+Enable-SmoothPainting $buttons
 
 $copyButton = New-Object System.Windows.Forms.Button
-$copyButton.Text = "复制回剪贴板"
-$copyButton.Width = 130
-$copyButton.Height = 30
+$copyButton.Text = "▣  复制回剪贴板"
+$copyButton.Width = 154
+$copyButton.Height = 34
 
 $refreshButton = New-Object System.Windows.Forms.Button
-$refreshButton.Text = "刷新"
-$refreshButton.Width = 80
-$refreshButton.Height = 30
+$refreshButton.Text = "↻  刷新"
+$refreshButton.Width = 82
+$refreshButton.Height = 34
 
 $collapseButton = New-Object System.Windows.Forms.Button
-$collapseButton.Text = "收起"
-$collapseButton.Width = 80
-$collapseButton.Height = 30
+$collapseButton.Text = "—  收起"
+$collapseButton.Width = 82
+$collapseButton.Height = 34
 
 $hideButton = New-Object System.Windows.Forms.Button
-$hideButton.Text = "隐藏"
-$hideButton.Width = 80
-$hideButton.Height = 30
+$hideButton.Text = "□  隐藏"
+$hideButton.Width = 82
+$hideButton.Height = 34
+
+$script:ButtonPrimaryStates = @{}
 
 function Set-ToolButtonStyle($Button, [bool]$Primary) {
     $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $Button.FlatAppearance.BorderSize = 1
-    $Button.FlatAppearance.BorderColor = if ($Primary) { $ThemeBlue } else { $ThemeBorder }
-    $Button.BackColor = if ($Primary) { [System.Drawing.Color]::FromArgb(18, 65, 118) } else { $ThemePanel }
+    $Button.FlatAppearance.BorderSize = 0
+    $Button.UseVisualStyleBackColor = $false
+    $Button.BackColor = $ThemeBack
     $Button.ForeColor = $ThemeText
     $Button.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 9)
-    $Button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 8, 8)
+    $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $Button.Margin = New-Object System.Windows.Forms.Padding(0, 0, 9, 8)
+    $script:ButtonPrimaryStates[$Button.GetHashCode()] = $Primary
+    $Button.Invalidate()
 }
 
 Set-ToolButtonStyle $copyButton $true
@@ -643,10 +1122,52 @@ Set-ToolButtonStyle $allModeButton ($script:ViewMode -eq "all")
 Set-ToolButtonStyle $imageModeButton ($script:ViewMode -eq "image")
 Set-ToolButtonStyle $textModeButton ($script:ViewMode -eq "text")
 
+foreach ($button in @($copyButton, $refreshButton, $collapseButton, $hideButton, $allModeButton, $imageModeButton, $textModeButton)) {
+    $button.Add_Paint({
+        param($sender, $e)
+        $primary = [bool]$script:ButtonPrimaryStates[$sender.GetHashCode()]
+        $hovered = $sender.ClientRectangle.Contains($sender.PointToClient([System.Windows.Forms.Control]::MousePosition))
+        $pressed = $hovered -and (([System.Windows.Forms.Control]::MouseButtons -band [System.Windows.Forms.MouseButtons]::Left) -ne 0)
+        $fillColor = if ($primary) {
+            if ($pressed) { [System.Drawing.Color]::FromArgb(68, 140, 226) } elseif ($hovered) { $ThemeBlueHover } else { $ThemeBlue }
+        }
+        else {
+            if ($pressed) { $ThemeCardSelected } elseif ($hovered) { [System.Drawing.Color]::FromArgb(34, 44, 60) } else { $ThemePanel }
+        }
+        $rect = New-Object System.Drawing.Rectangle -ArgumentList 1, 1, ($sender.Width - 3), ($sender.Height - 3)
+        $radius = [Math]::Max(10, [int](($sender.Height - 3) / 2))
+        $path = New-RoundedRectanglePath $rect $radius
+        $brush = New-Object System.Drawing.SolidBrush $fillColor
+        try {
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $e.Graphics.Clear($ThemeBack)
+            $e.Graphics.FillPath($brush, $path)
+            [System.Windows.Forms.TextRenderer]::DrawText(
+                $e.Graphics,
+                $sender.Text,
+                $sender.Font,
+                $rect,
+                $ThemeText,
+                [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor
+                [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor
+                [System.Windows.Forms.TextFormatFlags]::NoPadding
+            )
+        }
+        finally {
+            $brush.Dispose()
+            $path.Dispose()
+        }
+    })
+    $button.Add_MouseEnter({ param($sender, $e) $sender.Invalidate() })
+    $button.Add_MouseLeave({ param($sender, $e) $sender.Invalidate() })
+    $button.Add_MouseDown({ param($sender, $e) $sender.Invalidate() })
+    $button.Add_MouseUp({ param($sender, $e) $sender.Invalidate() })
+}
+
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = "正在监听复制内容..."
 $statusLabel.AutoSize = $true
-$statusLabel.Padding = New-Object System.Windows.Forms.Padding(8, 7, 0, 0)
+$statusLabel.Padding = New-Object System.Windows.Forms.Padding(8, 9, 0, 0)
 $statusLabel.ForeColor = $ThemeMuted
 $statusLabel.BackColor = $ThemeBack
 
@@ -672,14 +1193,81 @@ $picture = New-Object System.Windows.Forms.PictureBox
 $picture.Dock = "Fill"
 $picture.SizeMode = "Zoom"
 $picture.Visible = $false
-$picture.BackColor = [System.Drawing.Color]::Black
+$picture.BackColor = [System.Drawing.Color]::FromArgb(10, 13, 19)
 
 $previewHost = New-Object System.Windows.Forms.Panel
 $previewHost.Dock = "Fill"
-$previewHost.BackColor = [System.Drawing.Color]::Black
+$previewHost.BackColor = [System.Drawing.Color]::FromArgb(10, 13, 19)
 $previewHost.AutoScroll = $true
 $previewHost.Visible = $false
 $previewHost.TabStop = $true
+Enable-SmoothPainting $previewHost
+
+$previewSurface = New-Object System.Windows.Forms.Panel
+$previewSurface.Dock = "Fill"
+$previewSurface.Padding = New-Object System.Windows.Forms.Padding(7)
+$previewSurface.BackColor = $ThemeBack
+Enable-SmoothPainting $previewSurface
+
+$searchHost.Add_Paint({
+    param($sender, $e)
+    $rect = New-Object System.Drawing.Rectangle -ArgumentList 1, 1, ($sender.Width - 3), ($sender.Height - 3)
+    $path = New-RoundedRectanglePath $rect 13
+    $brush = New-Object System.Drawing.SolidBrush $ThemePanel
+    $pen = New-Object System.Drawing.Pen $ThemeBorderSoft
+    try {
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $e.Graphics.FillPath($brush, $path)
+        $e.Graphics.DrawPath($pen, $path)
+    }
+    finally {
+        $pen.Dispose()
+        $brush.Dispose()
+        $path.Dispose()
+    }
+})
+
+$previewSurface.Add_Paint({
+    param($sender, $e)
+    $rect = New-Object System.Drawing.Rectangle -ArgumentList 1, 1, ($sender.Width - 3), ($sender.Height - 3)
+    $path = New-RoundedRectanglePath $rect 16
+    $brush = New-Object System.Drawing.SolidBrush $ThemePanel
+    try {
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $e.Graphics.FillPath($brush, $path)
+    }
+    finally {
+        $brush.Dispose()
+        $path.Dispose()
+    }
+})
+
+$splitter.Add_Paint({
+    param($sender, $e)
+    $lineRect = New-Object System.Drawing.Rectangle -ArgumentList ([int](($sender.Width - 2) / 2)), 10, 2, ([Math]::Max(1, $sender.Height - 20))
+    $path = New-RoundedRectanglePath $lineRect 1
+    $brush = New-Object System.Drawing.SolidBrush $ThemeBorderSoft
+    try {
+        $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $e.Graphics.FillPath($brush, $path)
+    }
+    finally {
+        $brush.Dispose()
+        $path.Dispose()
+    }
+})
+
+$toolTip = New-Object System.Windows.Forms.ToolTip
+$toolTip.AutoPopDelay = 8000
+$toolTip.InitialDelay = 450
+$toolTip.ReshowDelay = 120
+$toolTip.SetToolTip($searchBox, "输入文字、文件路径或图片尺寸进行筛选")
+$toolTip.SetToolTip($copyButton, "把当前选中的内容放回系统剪贴板；多张图片会作为可粘贴的文件组复制")
+$toolTip.SetToolTip($allModeButton, "查看全部历史内容")
+$toolTip.SetToolTip($imageModeButton, "只查看图片，并支持框选和多选")
+$toolTip.SetToolTip($textModeButton, "只查看文字内容")
+$toolTip.SetToolTip($collapseButton, "收起为桌面悬浮球")
+$toolTip.SetToolTip($hideButton, "隐藏到系统托盘并继续监听")
 
 $buttons.Controls.Add($copyButton)
 $buttons.Controls.Add($refreshButton)
@@ -689,14 +1277,16 @@ $buttons.Controls.Add($statusLabel)
 $viewBar.Controls.Add($allModeButton)
 $viewBar.Controls.Add($imageModeButton)
 $viewBar.Controls.Add($textModeButton)
+$searchHost.Controls.Add($searchBox)
 $previewHost.Controls.Add($picture)
-$panel.Controls.Add($previewText)
-$panel.Controls.Add($previewHost)
+$previewSurface.Controls.Add($previewText)
+$previewSurface.Controls.Add($previewHost)
+$panel.Controls.Add($previewSurface)
 $panel.Controls.Add($buttons)
 $leftPanel.Controls.Add($list)
 $leftPanel.Controls.Add($imageGrid)
 $leftPanel.Controls.Add($viewBar)
-$leftPanel.Controls.Add($searchBox)
+$leftPanel.Controls.Add($searchHost)
 $form.Controls.Add($panel)
 $form.Controls.Add($splitter)
 $form.Controls.Add($leftPanel)
@@ -767,30 +1357,42 @@ function Update-ModeButtons {
     Set-ToolButtonStyle $textModeButton ($script:ViewMode -eq "text")
 }
 
-function Get-GridThumbnail($Item, [int]$Size) {
+function Clear-GridThumbnailCache {
+    foreach ($thumb in $script:GridThumbnailCache.Values) {
+        if ($thumb) { $thumb.Dispose() }
+    }
+    $script:GridThumbnailCache.Clear()
+    $script:GridThumbnailQueue.Clear()
+    $script:GridThumbnailPending.Clear()
+}
+
+function Get-GridThumbnail($Item) {
     $full = Join-Path $AppRoot ([string]$Item.imagePath)
     if (-not (Test-Path -LiteralPath $full)) {
         return $null
     }
 
+    if ($script:GridThumbnailCache.ContainsKey($full)) {
+        return $script:GridThumbnailCache[$full]
+    }
+
     try {
         $source = [System.Drawing.Image]::FromFile($full)
         try {
-            $thumb = New-Object System.Drawing.Bitmap -ArgumentList $Size, $Size
+            $maxSide = 360
+            $scale = [Math]::Min(1.0, $maxSide / [Math]::Max($source.Width, $source.Height))
+            $width = [Math]::Max(1, [int]($source.Width * $scale))
+            $height = [Math]::Max(1, [int]($source.Height * $scale))
+            $thumb = New-Object System.Drawing.Bitmap -ArgumentList $width, $height
             $g = [System.Drawing.Graphics]::FromImage($thumb)
             try {
-                $g.Clear([System.Drawing.Color]::FromArgb(24, 24, 24))
                 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-                $scale = [Math]::Min(($Size - 10) / $source.Width, ($Size - 10) / $source.Height)
-                $drawWidth = [int]($source.Width * $scale)
-                $drawHeight = [int]($source.Height * $scale)
-                $drawX = [int](($Size - $drawWidth) / 2)
-                $drawY = [int](($Size - $drawHeight) / 2)
-                $g.DrawImage($source, $drawX, $drawY, $drawWidth, $drawHeight)
+                $g.DrawImage($source, 0, 0, $width, $height)
             }
             finally {
                 $g.Dispose()
             }
+            $script:GridThumbnailCache[$full] = $thumb
             return $thumb
         }
         finally {
@@ -803,55 +1405,126 @@ function Get-GridThumbnail($Item, [int]$Size) {
     }
 }
 
+function Queue-GridThumbnail([int]$Index) {
+    if ($Index -lt 0 -or $Index -ge $script:DisplayItems.Count) {
+        return
+    }
+
+    $full = Join-Path $AppRoot ([string]$script:DisplayItems[$Index].imagePath)
+    if ($script:GridThumbnailCache.ContainsKey($full)) {
+        return
+    }
+
+    if ($script:GridThumbnailPending.Add($Index)) {
+        $script:GridThumbnailQueue.Enqueue($Index)
+    }
+}
+
+function Get-MaxImageColumns {
+    $padding = 8
+    $gap = 8
+    $scrollbarAllowance = 18
+    $minimumCellWidth = 54
+    $usableWidth = [Math]::Max($minimumCellWidth, $imageGrid.ClientSize.Width - ($padding * 2) - $scrollbarAllowance)
+    $columns = [int][Math]::Floor(($usableWidth + $gap) / ($minimumCellWidth + $gap))
+    return (Clamp-Value $columns 1 12)
+}
+
+function Normalize-ImageColumns {
+    $maxColumns = Get-MaxImageColumns
+    $script:ImageColumns = Clamp-Value $script:ImageColumns 1 $maxColumns
+    $script:Settings.imageColumns = $script:ImageColumns
+}
+
+function Get-ImageGridMetrics {
+    Normalize-ImageColumns
+    $padding = 8
+    $gap = 8
+    $scrollbarAllowance = 18
+    $usableWidth = [Math]::Max(100, $imageGrid.ClientSize.Width - ($padding * 2) - $scrollbarAllowance)
+    $cellWidth = [Math]::Max(54, [int][Math]::Floor(($usableWidth - (($script:ImageColumns - 1) * $gap)) / $script:ImageColumns))
+    $imageHeight = [Math]::Max(42, [int]($cellWidth * 0.68))
+    $cellHeight = $imageHeight + 42
+    $rowHeight = $cellHeight + $gap
+    $rows = if ($script:DisplayItems.Count -gt 0) { [int][Math]::Ceiling($script:DisplayItems.Count / [double]$script:ImageColumns) } else { 0 }
+    return [pscustomobject]@{
+        Padding = $padding
+        Gap = $gap
+        CellWidth = $cellWidth
+        ImageHeight = $imageHeight
+        CellHeight = $cellHeight
+        RowHeight = $rowHeight
+        Rows = $rows
+        ContentHeight = ($padding * 2) + ($rows * $rowHeight)
+    }
+}
+
+function Get-ImageCellRectangle([int]$Index, $Metrics) {
+    $row = [int][Math]::Floor($Index / $script:ImageColumns)
+    $column = $Index % $script:ImageColumns
+    $x = $Metrics.Padding + ($column * ($Metrics.CellWidth + $Metrics.Gap))
+    $y = $Metrics.Padding + ($row * $Metrics.RowHeight)
+    return New-Object System.Drawing.Rectangle -ArgumentList $x, $y, $Metrics.CellWidth, $Metrics.CellHeight
+}
+
+function Update-ImageGridLayout([bool]$KeepScroll) {
+    $oldY = if ($KeepScroll) { -$imageGrid.AutoScrollPosition.Y } else { 0 }
+    $metrics = Get-ImageGridMetrics
+    $imageGrid.AutoScrollMinSize = New-Object System.Drawing.Size -ArgumentList 0, $metrics.ContentHeight
+    if ($KeepScroll -and $oldY -gt 0) {
+        $imageGrid.AutoScrollPosition = New-Object System.Drawing.Point -ArgumentList 0, $oldY
+    }
+    $imageGrid.Invalidate()
+}
+
+function Set-HistoryViewVisibility {
+    $showImageGrid = ($script:ViewMode -eq "image")
+    $imageGrid.Visible = $showImageGrid
+    $list.Visible = -not $showImageGrid
+    if ($showImageGrid) {
+        $imageGrid.BringToFront()
+    }
+    else {
+        $list.BringToFront()
+    }
+    $viewBar.BringToFront()
+    $searchHost.BringToFront()
+}
+
+function Adjust-ImageGridColumns([int]$Direction) {
+    $oldColumns = $script:ImageColumns
+    # Positive direction enlarges cards, so fewer pictures are shown per row.
+    $script:ImageColumns = $script:ImageColumns - $Direction
+    Normalize-ImageColumns
+    if ($script:ImageColumns -ne $oldColumns) {
+        Write-Settings
+        Set-HistoryViewVisibility
+        Update-ImageGridLayout $true
+        $statusLabel.Text = "图片排版：每行 " + $script:ImageColumns + " 张"
+    }
+}
+
 function Populate-ImageGrid([string]$SelectedId) {
-    $oldImageList = $imageGrid.LargeImageList
-    $newImageList = New-Object System.Windows.Forms.ImageList
-    $newImageList.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
-    $size = [int](Clamp-Value ([int](118 * $script:ListScale)) 72 210)
-    $newImageList.ImageSize = New-Object System.Drawing.Size -ArgumentList $size, $size
-    $imageGrid.LargeImageList = $newImageList
-    if ($oldImageList -and -not [object]::ReferenceEquals($oldImageList, $newImageList)) {
-        $oldImageList.Dispose()
+    $previousIds = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($id in @($script:PendingImageSelectionIds)) {
+        if ($id) { [void]$previousIds.Add([string]$id) }
     }
+    if ($SelectedId) { [void]$previousIds.Add($SelectedId) }
 
-    $imageGrid.BeginUpdate()
-    try {
-        $imageGrid.Items.Clear()
-        for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
-            $item = $script:DisplayItems[$i]
-            $thumb = Get-GridThumbnail $item $size
-            if ($null -eq $thumb) {
-                $thumb = New-Object System.Drawing.Bitmap -ArgumentList $size, $size
-            }
-            [void]$newImageList.Images.Add($thumb)
-
-            $time = ([DateTime]::Parse($item.createdAt)).ToLocalTime().ToString("MM-dd HH:mm")
-            $text = $time + [Environment]::NewLine + $item.width + " x " + $item.height
-            $gridItem = New-Object System.Windows.Forms.ListViewItem -ArgumentList $text, $i
-            $gridItem.Tag = $i
-            [void]$imageGrid.Items.Add($gridItem)
-        }
-
-        if ($SelectedId) {
-            foreach ($gridItem in $imageGrid.Items) {
-                $idx = [int]$gridItem.Tag
-                if ([string]$script:DisplayItems[$idx].id -eq $SelectedId) {
-                    $gridItem.Selected = $true
-                    $gridItem.Focused = $true
-                    $gridItem.EnsureVisible()
-                    break
-                }
-            }
-        }
-
-        if ($imageGrid.SelectedItems.Count -eq 0 -and $imageGrid.Items.Count -gt 0) {
-            $imageGrid.Items[0].Selected = $true
-            $imageGrid.Items[0].Focused = $true
+    $script:ImageSelectedIndices.Clear()
+    for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
+        if ($previousIds.Contains([string]$script:DisplayItems[$i].id)) {
+            [void]$script:ImageSelectedIndices.Add($i)
         }
     }
-    finally {
-        $imageGrid.EndUpdate()
+    if ($script:ImageSelectedIndices.Count -eq 0 -and $script:DisplayItems.Count -gt 0) {
+        [void]$script:ImageSelectedIndices.Add(0)
+        $script:ImageSelectionAnchor = 0
     }
+    $script:PendingImageSelectionIds = @()
+    $script:GridThumbnailQueue.Clear()
+    $script:GridThumbnailPending.Clear()
+    Update-ImageGridLayout $false
 }
 
 function Populate-List([string]$SelectedId) {
@@ -882,9 +1555,9 @@ function Populate-List([string]$SelectedId) {
 }
 
 function Get-SelectedDisplayIndex {
-    if ($script:ViewMode -eq "image" -and $imageGrid.Visible) {
-        if ($imageGrid.SelectedItems.Count -gt 0) {
-            return [int]$imageGrid.SelectedItems[0].Tag
+    if ($script:ViewMode -eq "image") {
+        if ($script:ImageSelectedIndices.Count -gt 0) {
+            return [int](@($script:ImageSelectedIndices | Sort-Object)[0])
         }
         return -1
     }
@@ -899,10 +1572,36 @@ function Get-SelectedHistoryItem {
     return $script:DisplayItems[$idx]
 }
 
+function Get-SelectedHistoryItems {
+    $items = New-Object System.Collections.Generic.List[object]
+
+    if ($script:ViewMode -eq "image") {
+        foreach ($idx in @($script:ImageSelectedIndices | Sort-Object)) {
+            if ($idx -ge 0 -and $idx -lt $script:DisplayItems.Count) {
+                $items.Add($script:DisplayItems[$idx])
+            }
+        }
+        return @($items.ToArray())
+    }
+
+    $single = Get-SelectedHistoryItem
+    if ($null -ne $single) {
+        $items.Add($single)
+    }
+    return @($items.ToArray())
+}
+
 function Apply-Filter {
     $query = $searchBox.Text.Trim()
     $selected = Get-SelectedHistoryItem
     $selectedId = if ($selected) { [string]$selected.id } else { $null }
+    $script:PendingImageSelectionIds = @(
+        foreach ($idx in $script:ImageSelectedIndices) {
+            if ($idx -ge 0 -and $idx -lt $script:DisplayItems.Count) {
+                [string]$script:DisplayItems[$idx].id
+            }
+        }
+    )
     $items = New-Object System.Collections.Generic.List[object]
     foreach ($item in $script:HistoryItems) {
         if ((Test-HistoryItemModeMatch $item) -and (Test-HistoryItemMatch $item $query)) {
@@ -911,10 +1610,9 @@ function Apply-Filter {
     }
 
     $script:DisplayItems = @($items.ToArray())
-    $imageGrid.Visible = ($script:ViewMode -eq "image")
-    $list.Visible = -not $imageGrid.Visible
+    Set-HistoryViewVisibility
 
-    if ($imageGrid.Visible) {
+    if ($script:ViewMode -eq "image") {
         Populate-ImageGrid $selectedId
     }
     else {
@@ -927,7 +1625,7 @@ function Apply-Filter {
         $picture.Visible = $false
         $previewText.Text = "没有匹配的历史记录。"
     }
-    else {
+    elseif (-not $script:SuppressPreviewRefresh) {
         Show-Selected
     }
 
@@ -942,7 +1640,9 @@ function Apply-Filter {
 
 function Refresh-List {
     $script:HistoryItems = @(Remove-Old-History)
-    Clear-ThumbnailCache
+    # Keep already-rendered thumbnails. Recreating them from large source images
+    # during every refresh was the main cause of stutter while scrolling.
+    Prune-ThumbnailCache
     Apply-Filter
 }
 
@@ -950,16 +1650,27 @@ function Refresh-ListLayout {
     $selected = Get-SelectedHistoryItem
     $selectedId = if ($selected) { [string]$selected.id } else { $null }
 
-    Clear-ThumbnailCache
-    if ($script:ViewMode -eq "image" -and $imageGrid.Visible) {
-        Populate-ImageGrid $selectedId
+    if ($script:ViewMode -eq "image") {
+        Update-ImageGridLayout $true
     }
     else {
+        Clear-ThumbnailCache
         Populate-List $selectedId
     }
 }
 
 function Adjust-LeftLayout([int]$WheelDelta) {
+    if ($script:ViewMode -eq "image") {
+        $script:ImageWheelAccumulator += $WheelDelta
+        if ([Math]::Abs($script:ImageWheelAccumulator) -lt 120) {
+            return
+        }
+        $steps = [int][Math]::Truncate($script:ImageWheelAccumulator / 120)
+        $script:ImageWheelAccumulator -= ($steps * 120)
+        Adjust-ImageGridColumns $steps
+        return
+    }
+
     $direction = if ($WheelDelta -gt 0) { 1 } else { -1 }
     $script:ListScale = Clamp-Double ($script:ListScale + (0.08 * $direction)) 0.75 1.65
     $minLeft = 280
@@ -1030,26 +1741,20 @@ function Draw-HistoryListItem($EventArgs) {
     $graphics = $EventArgs.Graphics
     $selected = (($EventArgs.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
 
-    $backColor = if ($selected) { $ThemeCardSelected } else { $ThemeCard }
-    $borderColor = if ($selected) { $ThemeBlue } else { $ThemeBorder }
-    $titleColor = $ThemeText
-    $bodyColor = $ThemeMuted
-
-    $backBrush = New-Object System.Drawing.SolidBrush $backColor
-    $borderPen = New-Object System.Drawing.Pen $borderColor
-    $titleBrush = New-Object System.Drawing.SolidBrush $titleColor
-    $bodyBrush = New-Object System.Drawing.SolidBrush $bodyColor
-    $mutedBrush = New-Object System.Drawing.SolidBrush $ThemeBlue
-    $format = New-Object System.Drawing.StringFormat
+    $backBrush = if ($selected) { $script:DrawSelectedCardBrush } else { $script:DrawCardBrush }
+    $borderPen = if ($selected) { $script:DrawSelectedBorderPen } else { $script:DrawBorderPen }
+    $titleBrush = $script:DrawTitleBrush
+    $bodyBrush = $script:DrawBodyBrush
+    $mutedBrush = $script:DrawAccentBrush
+    $format = $script:DrawTextFormat
     $clipState = $null
+    $cardPath = $null
 
     try {
-        $format.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
-        $format.FormatFlags = [System.Drawing.StringFormatFlags]::LineLimit
-
         $card = New-Object System.Drawing.Rectangle -ArgumentList ($bounds.X + 4), ($bounds.Y + 4), ($bounds.Width - 8), ($bounds.Height - 8)
-        $graphics.FillRectangle($backBrush, $card)
-        $graphics.DrawRectangle($borderPen, $card)
+        $cardPath = New-RoundedRectanglePath $card 14
+        $graphics.FillPath($backBrush, $cardPath)
+        $graphics.DrawPath($borderPen, $cardPath)
         $clipState = $graphics.Save()
         $graphics.SetClip($card)
 
@@ -1069,19 +1774,18 @@ function Draw-HistoryListItem($EventArgs) {
             $thumbWidth = [int](104 * $script:ListScale)
             $thumbHeight = [int](78 * $script:ListScale)
             $thumbRect = New-Object System.Drawing.Rectangle -ArgumentList ($card.X + 10), ($card.Y + 32), $thumbWidth, $thumbHeight
+            $thumbPath = New-RoundedRectanglePath $thumbRect 9
+            $thumbClip = $graphics.Save()
+            $graphics.SetClip($thumbPath)
             $thumb = Get-Thumbnail ([string]$item.imagePath)
             if ($thumb) {
                 $graphics.DrawImage($thumb, $thumbRect)
             }
             else {
-                $missingBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(40, 40, 40))
-                try {
-                    $graphics.FillRectangle($missingBrush, $thumbRect)
-                }
-                finally {
-                    $missingBrush.Dispose()
-                }
+                $graphics.FillPath($script:DrawMissingBrush, $thumbPath)
             }
+            $graphics.Restore($thumbClip)
+            $thumbPath.Dispose()
             $textRect = New-Object System.Drawing.RectangleF -ArgumentList ($card.X + 20 + $thumbWidth), ($card.Y + 34), ($card.Width - 30 - $thumbWidth), ([int](56 * $script:ListScale))
             $imageInfo = "图片尺寸: " + $item.width + " x " + $item.height
             $graphics.DrawString($imageInfo, $list.Font, $bodyBrush, $textRect, $format)
@@ -1110,16 +1814,22 @@ function Draw-HistoryListItem($EventArgs) {
         if ($clipState) {
             $graphics.Restore($clipState)
         }
-        $format.Dispose()
-        $mutedBrush.Dispose()
-        $bodyBrush.Dispose()
-        $titleBrush.Dispose()
-        $borderPen.Dispose()
-        $backBrush.Dispose()
+        if ($cardPath) {
+            $cardPath.Dispose()
+        }
     }
 }
 
 function Show-Selected {
+    $selectedItems = @(Get-SelectedHistoryItems)
+    if ($script:ViewMode -eq "image" -and $selectedItems.Count -gt 1) {
+        $picture.Visible = $false
+        $previewHost.Visible = $false
+        $previewText.Visible = $true
+        $previewText.Text = "已选择 " + $selectedItems.Count + " 张图片。" + [Environment]::NewLine + "点击复制回剪贴板会把这些图片作为文件列表复制；也可以直接从左侧拖出去。"
+        return
+    }
+
     $item = Get-SelectedHistoryItem
     if ($null -eq $item) {
         return
@@ -1227,6 +1937,46 @@ function Start-HistoryDrag($Item, $Control) {
     }
 }
 
+function Start-HistoryDragItems($Items, $Control) {
+    $selectedItems = @($Items | Where-Object { $null -ne $_ })
+    if ($selectedItems.Count -eq 0 -or $null -eq $Control) {
+        return
+    }
+
+    if ($selectedItems.Count -eq 1) {
+        Start-HistoryDrag $selectedItems[0] $Control
+        return
+    }
+
+    $imageItems = @($selectedItems | Where-Object { $_.kind -eq "image" })
+    if ($imageItems.Count -ne $selectedItems.Count) {
+        Start-HistoryDrag $selectedItems[0] $Control
+        return
+    }
+
+    $data = New-Object System.Windows.Forms.DataObject
+    $files = New-Object System.Collections.Specialized.StringCollection
+    foreach ($item in $imageItems) {
+        $full = Join-Path $AppRoot ([string]$item.imagePath)
+        if (Test-Path -LiteralPath $full) {
+            [void]$files.Add($full)
+        }
+    }
+
+    if ($files.Count -eq 0) {
+        return
+    }
+
+    try {
+        $data.SetFileDropList($files)
+        [void]$Control.DoDragDrop($data, [System.Windows.Forms.DragDropEffects]::Copy)
+    }
+    catch {
+        Write-ErrorLog "多图拖拽复制失败。" $_
+        $statusLabel.Text = "多图拖拽失败，可以先点复制回剪贴板"
+    }
+}
+
 function Test-DragDistance {
     if ($null -eq $script:DragItem) {
         return $false
@@ -1249,7 +1999,7 @@ function Clear-DragCandidate {
 }
 
 function Save-ExpandedBounds {
-    if (-not $script:IsCollapsed) {
+    if (-not $script:IsCollapsed -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
         $script:Settings.expandedX = $form.Location.X
         $script:Settings.expandedY = $form.Location.Y
         $script:Settings.expandedWidth = $form.Width
@@ -1258,16 +2008,39 @@ function Save-ExpandedBounds {
     }
 }
 
+function Normalize-SplitLayout([bool]$SaveSetting) {
+    if ($script:IsCollapsed -or $script:IsNormalizingSplitLayout -or $form.ClientSize.Width -le 0) {
+        return
+    }
+
+    $minLeft = 280
+    $minRight = 360
+    $maxLeft = [Math]::Max($minLeft, $form.ClientSize.Width - $splitter.Width - $minRight)
+    $normalizedWidth = Clamp-Value ([int]$leftPanel.Width) $minLeft $maxLeft
+
+    if ($leftPanel.Width -ne $normalizedWidth) {
+        $script:IsNormalizingSplitLayout = $true
+        try {
+            $leftPanel.Width = $normalizedWidth
+        }
+        finally {
+            $script:IsNormalizingSplitLayout = $false
+        }
+    }
+
+    if ($SaveSetting -and $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal) {
+        $script:Settings.leftPanelWidth = $leftPanel.Width
+        Write-Settings
+    }
+
+    if ($imageGrid.Visible) {
+        Update-ImageGridLayout $true
+    }
+}
+
 function Save-BubbleBounds {
     $script:Settings.bubbleX = $form.Location.X
     $script:Settings.bubbleY = $form.Location.Y
-}
-
-function Set-BubbleShape {
-    if ($form.Region) {
-        $form.Region.Dispose()
-        $form.Region = $null
-    }
 }
 
 function Snap-BubbleToScreenEdge {
@@ -1315,6 +2088,10 @@ function Snap-BubbleToScreenEdge {
 
 function Show-Bubble {
     Save-ExpandedBounds
+    if ($form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized) {
+        $script:LastNonMinimizedWindowState = $form.WindowState
+    }
+    $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
     $script:IsCollapsed = $true
     $script:Settings.isCollapsed = $true
     $script:Settings.isHidden = $false
@@ -1343,7 +2120,6 @@ function Show-Bubble {
     $form.Location = New-Object System.Drawing.Point -ArgumentList ([int]$script:Settings.bubbleX), ([int]$script:Settings.bubbleY)
     $form.ResumeLayout($true)
 
-    Set-BubbleShape
     Snap-BubbleToScreenEdge
     $form.Show()
     $bubblePicture.Invalidate()
@@ -1352,7 +2128,9 @@ function Show-Bubble {
 }
 
 function Show-HistoryPanel {
-    Save-BubbleBounds
+    if ($script:IsCollapsed) {
+        Save-BubbleBounds
+    }
     $script:IsCollapsed = $false
     $script:Settings.isCollapsed = $false
     $script:Settings.isHidden = $false
@@ -1369,31 +2147,68 @@ function Show-HistoryPanel {
     $x = Clamp-Value ([int]$script:Settings.expandedX) $screen.Left ($screen.Right - $width)
     $y = Clamp-Value ([int]$script:Settings.expandedY) $screen.Top ($screen.Bottom - $height)
 
+    # Hide the 72px bubble before changing the same form into a large window.
+    # This prevents the old bubble and splitter from being visibly stretched.
+    $form.Hide()
+    Move-HistoryWindowToCurrentDesktop
     $form.SuspendLayout()
     $form.MinimumSize = New-Object System.Drawing.Size -ArgumentList 640, 420
     $form.MaximumSize = New-Object System.Drawing.Size -ArgumentList 0, 0
-    $form.FormBorderStyle = "SizableToolWindow"
+    $form.FormBorderStyle = "Sizable"
     $form.ControlBox = $true
-    $form.MinimizeBox = $false
-    $form.MaximizeBox = $false
+    $form.MinimizeBox = $true
+    $form.MaximizeBox = $true
     $form.BackColor = $ThemeBack
     $form.TransparencyKey = [System.Drawing.Color]::Empty
     $form.Size = New-Object System.Drawing.Size -ArgumentList ([int]$width), ([int]$height)
     $form.Location = New-Object System.Drawing.Point -ArgumentList ([int]$x), ([int]$y)
+    $leftPanel.Width = [int]$script:Settings.leftPanelWidth
     $bubblePicture.Visible = $false
     $leftPanel.Visible = $true
     $splitter.Visible = $true
-    $imageGrid.Visible = ($script:ViewMode -eq "image")
-    $list.Visible = -not $imageGrid.Visible
+    Set-HistoryViewVisibility
     $panel.Visible = $true
     $form.ResumeLayout($true)
+    Normalize-SplitLayout $true
 
-    Refresh-List
-    Show-Selected
-    $form.Activate()
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        $form.WindowState = $script:LastNonMinimizedWindowState
+    }
+    elseif ($script:LastNonMinimizedWindowState -eq [System.Windows.Forms.FormWindowState]::Maximized) {
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
+    }
+
+    if ($script:UiDirty) {
+        $script:SuppressPreviewRefresh = $true
+        try {
+            Apply-Filter
+        }
+        finally {
+            $script:SuppressPreviewRefresh = $false
+        }
+        $script:UiDirty = $false
+    }
+    elseif ($imageGrid.Visible) {
+        Update-ImageGridLayout $true
+    }
     Write-Settings
     $form.Show()
     $form.Activate()
+    [void]$form.BeginInvoke([System.Action]{
+        Show-Selected
+    })
+}
+
+function Move-HistoryWindowToCurrentDesktop {
+    try {
+        # The foreground application is already on the virtual desktop the
+        # user is viewing. Reuse its desktop id without creating any helper
+        # window, which avoids a Desktop Window Manager refresh/flash.
+        [VirtualDesktopWindowMover]::MoveToCurrentDesktop($form.Handle)
+    }
+    catch {
+        Write-ErrorLog "把历史窗口移动到当前虚拟桌面失败。" $_
+    }
 }
 
 function Hide-ToTray {
@@ -1415,9 +2230,105 @@ function Exit-App {
     $form.Close()
 }
 
+try {
+    $script:CtrlDoubleTapHook = New-Object CtrlDoubleTapHook
+    $ctrlShortcutTimer = New-Object System.Windows.Forms.Timer
+    $ctrlShortcutTimer.Interval = 60
+    $ctrlShortcutTimer.Add_Tick({
+        if ($script:CtrlDoubleTapHook -and $script:CtrlDoubleTapHook.ConsumeDoubleTap()) {
+            Show-HistoryPanel
+        }
+    })
+    $ctrlShortcutTimer.Start()
+}
+catch {
+    $script:CtrlDoubleTapHook = $null
+    $ctrlShortcutTimer = $null
+    Write-ErrorLog "Ctrl 双击快捷键监听启动失败。" $_
+}
+
 $list.Add_SelectedIndexChanged({ Show-Selected })
 
-$imageGrid.Add_SelectedIndexChanged({ Show-Selected })
+$imageGrid.Add_Paint({
+    param($sender, $e)
+    $metrics = Get-ImageGridMetrics
+    $scrollY = -$imageGrid.AutoScrollPosition.Y
+    $firstRow = [Math]::Max(0, [int][Math]::Floor($scrollY / $metrics.RowHeight))
+    $lastRow = [Math]::Min($metrics.Rows - 1, [int][Math]::Ceiling(($scrollY + $imageGrid.ClientSize.Height) / $metrics.RowHeight))
+    if ($lastRow -lt $firstRow) { return }
+
+    $e.Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $textFormat = New-Object System.Drawing.StringFormat
+    $textFormat.Alignment = [System.Drawing.StringAlignment]::Center
+    $textFormat.LineAlignment = [System.Drawing.StringAlignment]::Center
+    try {
+        $firstIndex = $firstRow * $script:ImageColumns
+        $lastIndex = [Math]::Min($script:DisplayItems.Count - 1, (($lastRow + 1) * $script:ImageColumns) - 1)
+        for ($i = $firstIndex; $i -le $lastIndex; $i++) {
+            $contentRect = Get-ImageCellRectangle $i $metrics
+            $card = New-Object System.Drawing.Rectangle -ArgumentList $contentRect.X, ($contentRect.Y - $scrollY), $contentRect.Width, $contentRect.Height
+            $selected = $script:ImageSelectedIndices.Contains($i)
+            $cardBrush = if ($selected) { $script:DrawSelectedCardBrush } else { $script:DrawCardBrush }
+            $cardPen = if ($selected) { $script:DrawSelectedBorderPen } else { $script:DrawBorderPen }
+            $path = New-RoundedRectanglePath $card 14
+            try {
+                $e.Graphics.FillPath($cardBrush, $path)
+                $e.Graphics.DrawPath($cardPen, $path)
+            }
+            finally { $path.Dispose() }
+
+            $imageRect = New-Object System.Drawing.Rectangle -ArgumentList ($card.X + 7), ($card.Y + 7), ($card.Width - 14), ($metrics.ImageHeight - 10)
+            $imagePath = New-RoundedRectanglePath $imageRect 10
+            $e.Graphics.FillPath($script:DrawMissingBrush, $imagePath)
+            $oldClip = $e.Graphics.Save()
+            $e.Graphics.SetClip($imagePath)
+            $item = $script:DisplayItems[$i]
+            $full = Join-Path $AppRoot ([string]$item.imagePath)
+            $thumb = if ($script:GridThumbnailCache.ContainsKey($full)) { $script:GridThumbnailCache[$full] } else { $null }
+            if ($thumb) {
+                $scale = [Math]::Min($imageRect.Width / $thumb.Width, $imageRect.Height / $thumb.Height)
+                $drawWidth = [Math]::Max(1, [int]($thumb.Width * $scale))
+                $drawHeight = [Math]::Max(1, [int]($thumb.Height * $scale))
+                $drawX = $imageRect.X + [int](($imageRect.Width - $drawWidth) / 2)
+                $drawY = $imageRect.Y + [int](($imageRect.Height - $drawHeight) / 2)
+                $e.Graphics.DrawImage($thumb, $drawX, $drawY, $drawWidth, $drawHeight)
+            }
+            else {
+                Queue-GridThumbnail $i
+            }
+            $e.Graphics.Restore($oldClip)
+            $imagePath.Dispose()
+
+            $localTime = ([DateTime]::Parse($item.createdAt)).ToLocalTime()
+            if ($metrics.CellWidth -lt 82) {
+                $label = $localTime.ToString("MM-dd") + [Environment]::NewLine + $localTime.ToString("HH:mm")
+            }
+            else {
+                $label = $localTime.ToString("MM-dd HH:mm") + [Environment]::NewLine + $item.width + " × " + $item.height
+            }
+            $labelRect = New-Object System.Drawing.RectangleF -ArgumentList $card.X, ($card.Y + $metrics.ImageHeight), $card.Width, 42
+            $e.Graphics.DrawString($label, $form.Font, $script:DrawTitleBrush, $labelRect, $textFormat)
+        }
+
+        if (-not $script:ImageRubberRect.IsEmpty) {
+            $rubber = New-Object System.Drawing.Rectangle -ArgumentList $script:ImageRubberRect.X, ($script:ImageRubberRect.Y - $scrollY), $script:ImageRubberRect.Width, $script:ImageRubberRect.Height
+            $rubberBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(45, $ThemeBlue))
+            $rubberPen = New-Object System.Drawing.Pen $ThemeBlue
+            try {
+                $e.Graphics.FillRectangle($rubberBrush, $rubber)
+                $e.Graphics.DrawRectangle($rubberPen, $rubber)
+            }
+            finally {
+                $rubberBrush.Dispose()
+                $rubberPen.Dispose()
+            }
+        }
+    }
+    finally {
+        $textFormat.Dispose()
+    }
+})
 
 $list.Add_MeasureItem({
     param($sender, $e)
@@ -1458,33 +2369,102 @@ $list.Add_MouseMove({
 
 $list.Add_MouseUp({ Clear-DragCandidate })
 
+function Get-ImageIndexAtPoint([System.Drawing.Point]$Point) {
+    $metrics = Get-ImageGridMetrics
+    $contentPoint = New-Object System.Drawing.Point -ArgumentList $Point.X, ($Point.Y - $imageGrid.AutoScrollPosition.Y)
+    for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
+        if ((Get-ImageCellRectangle $i $metrics).Contains($contentPoint)) {
+            return $i
+        }
+    }
+    return -1
+}
+
 $imageGrid.Add_MouseDown({
     param($sender, $e)
     if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) {
         return
     }
 
-    $gridItem = $imageGrid.GetItemAt($e.X, $e.Y)
-    if ($null -ne $gridItem) {
-        $gridItem.Selected = $true
-        $gridItem.Focused = $true
-        $idx = [int]$gridItem.Tag
-        if ($idx -ge 0 -and $idx -lt $script:DisplayItems.Count) {
-            Begin-DragCandidate $script:DisplayItems[$idx]
+    $imageGrid.Focus()
+    $idx = Get-ImageIndexAtPoint $e.Location
+    $modifiers = [System.Windows.Forms.Control]::ModifierKeys
+    if ($idx -ge 0) {
+        if (($modifiers -band [System.Windows.Forms.Keys]::Shift) -ne 0 -and $script:ImageSelectionAnchor -ge 0) {
+            $start = [Math]::Min($script:ImageSelectionAnchor, $idx)
+            $end = [Math]::Max($script:ImageSelectionAnchor, $idx)
+            if (($modifiers -band [System.Windows.Forms.Keys]::Control) -eq 0) {
+                $script:ImageSelectedIndices.Clear()
+            }
+            for ($i = $start; $i -le $end; $i++) { [void]$script:ImageSelectedIndices.Add($i) }
+        }
+        elseif (($modifiers -band [System.Windows.Forms.Keys]::Control) -ne 0) {
+            if ($script:ImageSelectedIndices.Contains($idx)) {
+                [void]$script:ImageSelectedIndices.Remove($idx)
+            }
+            else {
+                [void]$script:ImageSelectedIndices.Add($idx)
+            }
+            $script:ImageSelectionAnchor = $idx
+        }
+        else {
+            if (-not $script:ImageSelectedIndices.Contains($idx)) {
+                $script:ImageSelectedIndices.Clear()
+                [void]$script:ImageSelectedIndices.Add($idx)
+            }
+            $script:ImageSelectionAnchor = $idx
+        }
+        Begin-DragCandidate @(Get-SelectedHistoryItems)
+        $script:IsImageRubberSelecting = $false
+    }
+    else {
+        $script:IsImageRubberSelecting = $true
+        $script:ImageRubberStart = New-Object System.Drawing.Point -ArgumentList $e.X, ($e.Y - $imageGrid.AutoScrollPosition.Y)
+        $script:ImageRubberRect = New-Object System.Drawing.Rectangle -ArgumentList $script:ImageRubberStart.X, $script:ImageRubberStart.Y, 0, 0
+        $script:ImageRubberBaseSelection = if (($modifiers -band [System.Windows.Forms.Keys]::Control) -ne 0) { @($script:ImageSelectedIndices) } else { @() }
+        if (($modifiers -band [System.Windows.Forms.Keys]::Control) -eq 0) {
+            $script:ImageSelectedIndices.Clear()
         }
     }
+    $imageGrid.Invalidate()
+    Show-Selected
 })
 
 $imageGrid.Add_MouseMove({
     param($sender, $e)
-    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -ne 0 -and (Test-DragDistance)) {
-        $item = $script:DragItem
+    if (($e.Button -band [System.Windows.Forms.MouseButtons]::Left) -eq 0) { return }
+
+    if ($script:IsImageRubberSelecting) {
+        $current = New-Object System.Drawing.Point -ArgumentList $e.X, ($e.Y - $imageGrid.AutoScrollPosition.Y)
+        $left = [Math]::Min($script:ImageRubberStart.X, $current.X)
+        $top = [Math]::Min($script:ImageRubberStart.Y, $current.Y)
+        $width = [Math]::Abs($current.X - $script:ImageRubberStart.X)
+        $height = [Math]::Abs($current.Y - $script:ImageRubberStart.Y)
+        $script:ImageRubberRect = New-Object System.Drawing.Rectangle -ArgumentList $left, $top, $width, $height
+        $script:ImageSelectedIndices.Clear()
+        foreach ($baseIndex in $script:ImageRubberBaseSelection) { [void]$script:ImageSelectedIndices.Add([int]$baseIndex) }
+        $metrics = Get-ImageGridMetrics
+        for ($i = 0; $i -lt $script:DisplayItems.Count; $i++) {
+            if ($script:ImageRubberRect.IntersectsWith((Get-ImageCellRectangle $i $metrics))) {
+                [void]$script:ImageSelectedIndices.Add($i)
+            }
+        }
+        $imageGrid.Invalidate()
+        Show-Selected
+    }
+    elseif (Test-DragDistance) {
+        $items = @($script:DragItem)
         Clear-DragCandidate
-        Start-HistoryDrag $item $imageGrid
+        Start-HistoryDragItems $items $imageGrid
     }
 })
 
-$imageGrid.Add_MouseUp({ Clear-DragCandidate })
+$imageGrid.Add_MouseUp({
+    $script:IsImageRubberSelecting = $false
+    $script:ImageRubberRect = [System.Drawing.Rectangle]::Empty
+    Clear-DragCandidate
+    $imageGrid.Invalidate()
+})
 
 $previewText.Add_MouseDown({
     param($sender, $e)
@@ -1563,10 +2543,48 @@ $list.Add_MouseWheel({
 
 $imageGrid.Add_MouseWheel({
     param($sender, $e)
+    $script:LastImageGridScrollAt = [DateTime]::UtcNow
     if (([System.Windows.Forms.Control]::ModifierKeys -band [System.Windows.Forms.Keys]::Control) -ne 0) {
         Adjust-LeftLayout $e.Delta
     }
 })
+
+$imageGrid.Add_Scroll({
+    $script:LastImageGridScrollAt = [DateTime]::UtcNow
+})
+
+$imageGrid.Add_Resize({
+    if ($imageGrid.Visible) {
+        Update-ImageGridLayout $true
+    }
+})
+
+$gridThumbnailTimer = New-Object System.Windows.Forms.Timer
+$gridThumbnailTimer.Interval = 40
+$gridThumbnailTimer.Add_Tick({
+    if (-not $imageGrid.Visible -or $script:GridThumbnailQueue.Count -eq 0) {
+        return
+    }
+
+    # Disk image decoding on the UI thread competes directly with scrolling.
+    # Wait until the wheel/scrollbar has been idle briefly before decoding.
+    if (([DateTime]::UtcNow - $script:LastImageGridScrollAt).TotalMilliseconds -lt 140) {
+        return
+    }
+
+    $idx = $script:GridThumbnailQueue.Dequeue()
+    [void]$script:GridThumbnailPending.Remove($idx)
+    if ($idx -ge 0 -and $idx -lt $script:DisplayItems.Count) {
+        [void](Get-GridThumbnail $script:DisplayItems[$idx])
+        $metrics = Get-ImageGridMetrics
+        $contentRect = Get-ImageCellRectangle $idx $metrics
+        $visibleRect = New-Object System.Drawing.Rectangle -ArgumentList $contentRect.X, ($contentRect.Y + $imageGrid.AutoScrollPosition.Y), $contentRect.Width, $contentRect.Height
+        if ($imageGrid.ClientRectangle.IntersectsWith($visibleRect)) {
+            $imageGrid.Invalidate($visibleRect)
+        }
+    }
+})
+$gridThumbnailTimer.Start()
 
 $searchBox.Add_MouseWheel({
     param($sender, $e)
@@ -1591,14 +2609,36 @@ $picture.Add_MouseWheel({
 
 $previewHost.Add_Resize({ Update-PreviewZoom })
 
+foreach ($button in @($copyButton, $refreshButton, $collapseButton, $hideButton, $allModeButton, $imageModeButton, $textModeButton)) {
+    $button.Add_Resize({
+        param($sender, $e)
+        $sender.Invalidate()
+    })
+}
+
 $copyButton.Add_Click({
-    $item = Get-SelectedHistoryItem
-    if ($null -eq $item) {
+    $items = @(Get-SelectedHistoryItems)
+    if ($items.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("请先在左侧选一条历史记录。", "历史粘贴板") | Out-Null
         return
     }
-    Set-ClipboardFromItem $item
-    $statusLabel.Text = "已复制回剪贴板"
+    try {
+        $copiedCount = Set-ClipboardFromItems $items
+    }
+    catch {
+        Write-ErrorLog "恢复历史内容到剪贴板失败。" $_
+        $statusLabel.Text = "复制失败：剪贴板正被其他程序占用，请再试一次"
+        return
+    }
+    if ($copiedCount -gt 1) {
+        $statusLabel.Text = "已复制 " + $copiedCount + " 张图片，可切换到目标位置直接粘贴"
+    }
+    elseif ($copiedCount -eq 1) {
+        $statusLabel.Text = "已复制回剪贴板"
+    }
+    else {
+        $statusLabel.Text = "复制失败：图片文件不存在或剪贴板暂时不可用"
+    }
 })
 
 $refreshButton.Add_Click({ Refresh-List; Show-Selected })
@@ -1649,7 +2689,12 @@ $notifyIcon.Add_MouseClick({
 })
 
 $splitter.Add_SplitterMoved({
-    if (-not $script:IsCollapsed) {
+    if (
+        -not $script:IsCollapsed -and
+        -not $script:IsNormalizingSplitLayout -and
+        $form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal
+    ) {
+        Normalize-SplitLayout $false
         $script:Settings.leftPanelWidth = $leftPanel.Width
         Write-Settings
     }
@@ -1658,7 +2703,52 @@ $splitter.Add_SplitterMoved({
 $form.Add_ResizeEnd({
     if (-not $script:IsCollapsed) {
         Save-ExpandedBounds
+        if ($imageGrid.Visible) {
+            Update-ImageGridLayout $true
+        }
         Write-Settings
+    }
+})
+
+$form.Add_Resize({
+    if (-not $script:IsCollapsed -and $form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized) {
+        $script:LastNonMinimizedWindowState = $form.WindowState
+        [void]$form.BeginInvoke([System.Action]{
+            Normalize-SplitLayout ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Normal)
+        })
+    }
+})
+
+$form.Add_KeyDown({
+    param($sender, $e)
+
+    if (
+        $e.Control -and
+        -not $script:IsCollapsed -and
+        $script:ViewMode -eq "image" -and
+        $e.KeyCode -in @(
+            [System.Windows.Forms.Keys]::Oemplus,
+            [System.Windows.Forms.Keys]::Add,
+            [System.Windows.Forms.Keys]::OemMinus,
+            [System.Windows.Forms.Keys]::Subtract
+        )
+    ) {
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Oemplus -or $e.KeyCode -eq [System.Windows.Forms.Keys]::Add) {
+            Adjust-ImageGridColumns 1
+        }
+        else {
+            Adjust-ImageGridColumns -1
+        }
+        $imageGrid.Focus()
+        $e.SuppressKeyPress = $true
+        $e.Handled = $true
+        return
+    }
+
+    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Escape -and -not $script:IsCollapsed) {
+        $e.SuppressKeyPress = $true
+        $e.Handled = $true
+        Show-Bubble
     }
 })
 
@@ -1720,7 +2810,12 @@ $timer.Add_Tick({
     try {
         if (((Get-Date) - $script:LastPurge).TotalMinutes -ge 10) {
             $script:LastPurge = Get-Date
-            Refresh-List
+            $script:HistoryItems = @(Remove-Old-History)
+            $script:UiDirty = $true
+            if (-not $script:IsCollapsed -and $form.Visible) {
+                Apply-Filter
+                $script:UiDirty = $false
+            }
         }
 
         $snapshot = Get-ClipboardSnapshot
@@ -1732,9 +2827,14 @@ $timer.Add_Tick({
         }
         $script:LastHash = $snapshot.Hash
         if (Add-HistoryItem $snapshot) {
-            Refresh-List
-            if ($list.Visible -and $list.Items.Count -gt 0) {
-                $list.SelectedIndex = 0
+            $script:HistoryItems = @(Read-History)
+            $script:UiDirty = $true
+            if (-not $script:IsCollapsed -and $form.Visible) {
+                Apply-Filter
+                $script:UiDirty = $false
+                if ($list.Visible -and $list.Items.Count -gt 0) {
+                    $list.SelectedIndex = 0
+                }
             }
             $statusLabel.Text = "刚刚保存了一条复制内容"
         }
@@ -1746,7 +2846,7 @@ $timer.Add_Tick({
 })
 
 $form.Add_Shown({
-    Refresh-List
+    $script:UiDirty = $true
     if ($script:Settings.isHidden) {
         Hide-ToTray
     }
@@ -1764,11 +2864,19 @@ $form.Add_FormClosing({
 
     if (-not $script:AllowExit) {
         $e.Cancel = $true
-        Hide-ToTray
+        if (-not $script:IsCollapsed) {
+            [void]$form.BeginInvoke([System.Action]{
+                Show-Bubble
+            })
+        }
         return
     }
 
     $timer.Stop()
+    $gridThumbnailTimer.Stop()
+    if ($ctrlShortcutTimer) {
+        $ctrlShortcutTimer.Stop()
+    }
     if ($script:IsCollapsed) {
         Save-BubbleBounds
     }
@@ -1782,11 +2890,35 @@ $form.Add_FormClosing({
         $picture.Image.Dispose()
     }
     Clear-ThumbnailCache
+    Clear-GridThumbnailCache
+    $gridThumbnailTimer.Dispose()
     if ($form.Region) {
         $form.Region.Dispose()
     }
     if ($bubblePicture.Image) {
         $bubblePicture.Image.Dispose()
+    }
+    foreach ($resource in @(
+        $script:DrawCardBrush,
+        $script:DrawSelectedCardBrush,
+        $script:DrawBorderPen,
+        $script:DrawSelectedBorderPen,
+        $script:DrawTitleBrush,
+        $script:DrawBodyBrush,
+        $script:DrawAccentBrush,
+        $script:DrawMissingBrush,
+        $script:DrawTextFormat
+    )) {
+        if ($resource) {
+            $resource.Dispose()
+        }
+    }
+    if ($script:CtrlDoubleTapHook) {
+        $script:CtrlDoubleTapHook.Dispose()
+        $script:CtrlDoubleTapHook = $null
+    }
+    if ($ctrlShortcutTimer) {
+        $ctrlShortcutTimer.Dispose()
     }
     $notifyIcon.Dispose()
     $trayMenu.Dispose()

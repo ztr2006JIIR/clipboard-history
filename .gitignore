@@ -1,4 +1,6 @@
 data/
+.agents/
+.codex/
 *.log
 *.tmp
 Thumbs.db
