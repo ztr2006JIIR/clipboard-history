@@ -30,7 +30,27 @@ foreach ($forbidden in @('.git', '.agents', '.codex')) {
 $shortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) '历史粘贴板.lnk'
 if (-not (Test-Path -LiteralPath $shortcut)) { throw 'Desktop shortcut is missing.' }
 $shell = New-Object -ComObject WScript.Shell
-if ($shell.CreateShortcut($shortcut).TargetPath -ne (Join-Path $installDir 'ClipboardHistory.exe')) { throw 'Incorrect shortcut target.' }
+$shortcutTarget = $shell.CreateShortcut($shortcut).TargetPath
+$expectedTarget = Join-Path $installDir 'ClipboardHistory.exe'
+Write-Output "Shortcut target: $shortcutTarget"
+Write-Output "Installed target: $expectedTarget"
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class InstallerTestPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetLongPathName(string path, StringBuilder output, uint size);
+    public static string Expand(string path) {
+        StringBuilder result = new StringBuilder(32768);
+        uint length = GetLongPathName(path, result, (uint)result.Capacity);
+        if (length == 0 || length >= result.Capacity) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return result.ToString();
+    }
+}
+'@
+if ([InstallerTestPath]::Expand($shortcutTarget) -ne [InstallerTestPath]::Expand($expectedTarget)) { throw 'Incorrect shortcut target.' }
 $launcher = Start-Process -FilePath (Join-Path $installDir 'ClipboardHistory.exe') -ArgumentList '--check' -PassThru -Wait -WindowStyle Hidden
 if ($launcher.ExitCode -ne 0) { throw 'Installed launcher check failed.' }
 
