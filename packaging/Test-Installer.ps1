@@ -40,6 +40,23 @@ using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class InstallerTestPath {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+    private class ShellLink { }
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellLink {
+        [PreserveSig] int GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr findData, uint flags);
+    }
+    public static string Target(string shortcut) {
+        object link = new ShellLink();
+        try {
+            ((System.Runtime.InteropServices.ComTypes.IPersistFile)link).Load(shortcut, 0);
+            StringBuilder output = new StringBuilder(32768);
+            int result = ((IShellLink)link).GetPath(output, output.Capacity, IntPtr.Zero, 4);
+            if (result < 0) Marshal.ThrowExceptionForHR(result);
+            return Environment.ExpandEnvironmentVariables(output.ToString());
+        }
+        finally { Marshal.FinalReleaseComObject(link); }
+    }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetLongPathName(string path, StringBuilder output, uint size);
     public static string Expand(string path) {
@@ -50,6 +67,14 @@ public static class InstallerTestPath {
     }
 }
 '@
+if ([string]::IsNullOrWhiteSpace($shortcutTarget)) {
+    $shortcutTarget = [InstallerTestPath]::Target($shortcut)
+    Write-Output "Native shell shortcut target: $shortcutTarget"
+}
+if ([string]::IsNullOrWhiteSpace($shortcutTarget)) {
+    Write-Output ('Shortcut bytes: ' + [Convert]::ToBase64String([IO.File]::ReadAllBytes($shortcut)))
+    throw 'The installed shortcut has no executable target.'
+}
 if ([InstallerTestPath]::Expand($shortcutTarget) -ne [InstallerTestPath]::Expand($expectedTarget)) { throw 'Incorrect shortcut target.' }
 $launcher = Start-Process -FilePath (Join-Path $installDir 'ClipboardHistory.exe') -ArgumentList '--check' -PassThru -Wait -WindowStyle Hidden
 if ($launcher.ExitCode -ne 0) { throw 'Installed launcher check failed.' }
