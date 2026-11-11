@@ -7,6 +7,9 @@
 #ifndef OutputPath
   #error OutputPath is required.
 #endif
+#ifndef ChineseLanguageFile
+  #error ChineseLanguageFile must identify the checksum-verified official translation.
+#endif
 
 [Setup]
 AppId={{6C606680-5314-4CD8-B52B-E6698920F45D}
@@ -34,7 +37,7 @@ RestartApplications=no
 Uninstallable=yes
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "{#ChineseLanguageFile}"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]

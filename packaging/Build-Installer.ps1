@@ -65,7 +65,12 @@ $inno = @(
     (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
 ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 if (-not $inno) { throw 'Inno Setup 6 is required. The GitHub release workflow includes it.' }
-& $inno "/DAppVersion=$Version" "/DPayloadDir=$payload" "/DOutputPath=$output" (Join-Path $PSScriptRoot 'installer.iss')
+# The compiler's standard installation omits this official translation.
+# Pin both its upstream revision and SHA-256 instead of fetching mutable content.
+$languageFile = Join-Path $build 'ChineseSimplified.isl'
+Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/02bbcabce6be6bad738d565d7a02d12b95a45af0/Files/Languages/ChineseSimplified.isl' -OutFile $languageFile
+if ((Get-FileHash -LiteralPath $languageFile -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'e0b0b350e2245f3c5e65586dfe43d574f6e7f06f2261149aba284954b3fc9a8d') { throw 'Official language file checksum mismatch.' }
+& $inno "/DAppVersion=$Version" "/DPayloadDir=$payload" "/DOutputPath=$output" "/DChineseLanguageFile=$languageFile" (Join-Path $PSScriptRoot 'installer.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
 $installer = Join-Path $output "ClipboardHistory-Setup-$Version.exe"
 $hashLine = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + [System.IO.Path]::GetFileName($installer) + "`n"
