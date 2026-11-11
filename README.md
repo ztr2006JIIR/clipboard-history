@@ -4,6 +4,21 @@
 
 ## 怎么使用
 
+### 下载 Windows 安装版（推荐）
+
+1. 打开 [最新发行版](https://github.com/ztr2006JIIR/clipboard-history/releases/latest)。
+2. 在附件中下载 `ClipboardHistory-Setup-版本号.exe`，不是 `Source code` 源码压缩包。
+3. 双击安装包，按向导安装。默认仅安装给当前 Windows 用户，不需要管理员权限。
+4. 安装后双击桌面或开始菜单中的「历史粘贴板」即可启动，不需要自行运行脚本或安装开发工具。
+
+安装版适用于 Windows 10 / 11（需要系统自带的 Windows PowerShell 5.1 和 .NET Framework 4.x）。程序默认安装在 `%LOCALAPPDATA%\Programs\ClipboardHistory`，该目录下的 `data` 文件夹保存当前用户的历史和设置。安装包不含作者的私人历史。
+
+更新前先从托盘菜单「退出」，再运行新版本安装包。覆盖安装保留历史；通过 Windows 设置卸载也不会主动删除 `data`。安装版不会自动导入其他文件夹中便携版的历史，也不会默认设置开机自启。
+
+当前安装包尚未购买代码签名证书，Windows 可能显示发布者未知或安全提示；请核对下载来源，不要关闭系统安全保护。
+
+### 源码 / 便携方式
+
 1. 推荐双击 `Start-ClipboardHistory.vbs`，它会静默启动，不显示 PowerShell 黑窗口。也可以双击 `Start-ClipboardHistory.bat` 启动。
 2. 启动后屏幕上会出现一个写着「剪」的小圆圈。
 3. 平时不用时，让这个小圆圈留在屏幕上即可，它会继续监听你复制的内容。
