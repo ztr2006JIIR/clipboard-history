@@ -80,7 +80,7 @@ $launcher = Start-Process -FilePath (Join-Path $installDir 'ClipboardHistory.exe
 if ($launcher.ExitCode -ne 0) { throw 'Installed launcher check failed.' }
 
 # Compile the embedded Windows interop helpers without starting clipboard capture.
-$text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes((Join-Path $installDir 'clipboard-history.ps1')))
+$text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes((Join-Path $installDir 'clipboard-history.ps1'))).TrimStart([char]0xFEFF)
 $embedded = [regex]::Match($text, '(?s)Add-Type -TypeDefinition @"\r?\n(.*?)\r?\n"@')
 if (-not $embedded.Success) { throw 'Cannot locate Windows helper source.' }
 Add-Type -AssemblyName System.Windows.Forms
