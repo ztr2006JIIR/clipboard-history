@@ -189,7 +189,10 @@ public static class VirtualDesktopWindowMover
 
             Guid desktopId;
             if (!TryGetCurrentDesktopId(manager, targetWindow, out desktopId))
-                throw new InvalidOperationException("找不到当前虚拟桌面上的参考窗口。");
+            {
+                if (!TryGetProbeDesktopId(manager, out desktopId))
+                    throw new InvalidOperationException("找不到当前虚拟桌面上的参考窗口。");
+            }
 
             int moveResult = manager.MoveWindowToDesktop(targetWindow, ref desktopId);
             if (moveResult != 0)
@@ -242,7 +245,52 @@ public static class VirtualDesktopWindowMover
         return desktopId != Guid.Empty;
     }
 
+    private static bool TryGetProbeDesktopId(IVirtualDesktopManager manager, out Guid desktopId)
+    {
+        desktopId = Guid.Empty;
+        IntPtr probeWindow = IntPtr.Zero;
+        try
+        {
+            // Some virtual desktops can be visually "empty", or the foreground
+            // window can be a shell/task-view surface that IVirtualDesktopManager
+            // does not expose. Create a tiny off-screen tool window on the
+            // desktop the user is currently viewing and use its desktop id.
+            probeWindow = CreateWindowEx(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                "STATIC",
+                "ClipboardHistoryDesktopProbe",
+                WS_POPUP,
+                -32000,
+                -32000,
+                1,
+                1,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                IntPtr.Zero);
+
+            if (probeWindow == IntPtr.Zero)
+                return false;
+
+            ShowWindow(probeWindow, SW_SHOWNOACTIVATE);
+            UpdateWindow(probeWindow);
+
+            return manager.GetWindowDesktopId(probeWindow, out desktopId) == 0 &&
+                desktopId != Guid.Empty;
+        }
+        finally
+        {
+            if (probeWindow != IntPtr.Zero)
+                DestroyWindow(probeWindow);
+        }
+    }
+
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    private const int WS_POPUP = unchecked((int)0x80000000);
+    private const int WS_EX_TOOLWINDOW = 0x00000080;
+    private const int WS_EX_NOACTIVATE = 0x08000000;
+    private const int SW_SHOWNOACTIVATE = 4;
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
@@ -254,6 +302,33 @@ public static class VirtualDesktopWindowMover
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateWindowEx(
+        int dwExStyle,
+        string lpClassName,
+        string lpWindowName,
+        int dwStyle,
+        int x,
+        int y,
+        int nWidth,
+        int nHeight,
+        IntPtr hWndParent,
+        IntPtr hMenu,
+        IntPtr hInstance,
+        IntPtr lpParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UpdateWindow(IntPtr hWnd);
 }
 "@
 
@@ -267,7 +342,7 @@ $BubbleIconFile = Join-Path $AppRoot "app-bubble.png"
 $HistoryFile = Join-Path $DataDir "history.json"
 $ErrorLogFile = Join-Path $DataDir "error.log"
 $SettingsFile = Join-Path $DataDir "settings.json"
-$RetentionDays = 3
+$RetentionDays = 30
 $BubbleSize = 72
 $TransparentColor = [System.Drawing.Color]::FromArgb(255, 1, 2, 3)
 $ThemeBack = [System.Drawing.Color]::FromArgb(15, 19, 28)
@@ -982,7 +1057,7 @@ $script:DrawTextFormat.Trimming = [System.Drawing.StringTrimming]::EllipsisWord
 $script:DrawTextFormat.FormatFlags = [System.Drawing.StringFormatFlags]::LineLimit
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "历史粘贴板 - 自动保存 3 天"
+$form.Text = "历史粘贴板 - 自动保存 30 天"
 $form.Width = [int]$script:Settings.expandedWidth
 $form.Height = [int]$script:Settings.expandedHeight
 $form.StartPosition = "Manual"
@@ -1003,6 +1078,19 @@ $leftPanel.BackColor = $ThemeBack
 $leftPanel.TabStop = $true
 Enable-SmoothPainting $leftPanel
 
+$leftLayout = New-Object System.Windows.Forms.TableLayoutPanel
+$leftLayout.Dock = "Fill"
+$leftLayout.ColumnCount = 1
+$leftLayout.RowCount = 3
+$leftLayout.Margin = New-Object System.Windows.Forms.Padding(0)
+$leftLayout.Padding = New-Object System.Windows.Forms.Padding(0)
+$leftLayout.BackColor = $ThemeBack
+[void]$leftLayout.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+[void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 50)))
+[void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 50)))
+[void]$leftLayout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+Enable-SmoothPainting $leftLayout
+
 $splitter = New-Object System.Windows.Forms.Splitter
 $splitter.Dock = "Left"
 $splitter.Width = 10
@@ -1012,9 +1100,9 @@ $splitter.BackColor = $ThemeBack
 $splitter.Cursor = [System.Windows.Forms.Cursors]::VSplit
 
 $searchHost = New-Object System.Windows.Forms.Panel
-$searchHost.Dock = "Top"
-$searchHost.Height = 42
-$searchHost.Padding = New-Object System.Windows.Forms.Padding(13, 8, 13, 7)
+$searchHost.Dock = "Fill"
+$searchHost.Margin = New-Object System.Windows.Forms.Padding(0)
+$searchHost.Padding = New-Object System.Windows.Forms.Padding(0, 4, 0, 6)
 $searchHost.BackColor = $ThemeBack
 Enable-SmoothPainting $searchHost
 
@@ -1026,12 +1114,19 @@ $searchBox.ForeColor = $ThemeText
 $searchBox.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
 
 $viewBar = New-Object System.Windows.Forms.FlowLayoutPanel
-$viewBar.Dock = "Top"
-$viewBar.Height = 50
+$viewBar.Dock = "Fill"
+$viewBar.Margin = New-Object System.Windows.Forms.Padding(0)
 $viewBar.FlowDirection = "LeftToRight"
 $viewBar.BackColor = $ThemeBack
 $viewBar.Padding = New-Object System.Windows.Forms.Padding(0, 12, 0, 0)
 Enable-SmoothPainting $viewBar
+
+$leftContentHost = New-Object System.Windows.Forms.Panel
+$leftContentHost.Dock = "Fill"
+$leftContentHost.Margin = New-Object System.Windows.Forms.Padding(0)
+$leftContentHost.Padding = New-Object System.Windows.Forms.Padding(0, 12, 0, 0)
+$leftContentHost.BackColor = $ThemeBack
+Enable-SmoothPainting $leftContentHost
 
 $allModeButton = New-Object System.Windows.Forms.Button
 $allModeButton.Text = "▦  全部"
@@ -1283,10 +1378,12 @@ $previewSurface.Controls.Add($previewText)
 $previewSurface.Controls.Add($previewHost)
 $panel.Controls.Add($previewSurface)
 $panel.Controls.Add($buttons)
-$leftPanel.Controls.Add($list)
-$leftPanel.Controls.Add($imageGrid)
-$leftPanel.Controls.Add($viewBar)
-$leftPanel.Controls.Add($searchHost)
+$leftContentHost.Controls.Add($list)
+$leftContentHost.Controls.Add($imageGrid)
+$leftLayout.Controls.Add($viewBar, 0, 0)
+$leftLayout.Controls.Add($searchHost, 0, 1)
+$leftLayout.Controls.Add($leftContentHost, 0, 2)
+$leftPanel.Controls.Add($leftLayout)
 $form.Controls.Add($panel)
 $form.Controls.Add($splitter)
 $form.Controls.Add($leftPanel)
@@ -1438,8 +1535,8 @@ function Normalize-ImageColumns {
 
 function Get-ImageGridMetrics {
     Normalize-ImageColumns
-    $padding = 8
-    $gap = 8
+    $padding = 10
+    $gap = 10
     $scrollbarAllowance = 18
     $usableWidth = [Math]::Max(100, $imageGrid.ClientSize.Width - ($padding * 2) - $scrollbarAllowance)
     $cellWidth = [Math]::Max(54, [int][Math]::Floor(($usableWidth - (($script:ImageColumns - 1) * $gap)) / $script:ImageColumns))
@@ -1631,7 +1728,7 @@ function Apply-Filter {
 
     $modeText = Get-ViewModeText
     if ([string]::IsNullOrWhiteSpace($query)) {
-        $statusLabel.Text = $modeText + "：共 " + $script:DisplayItems.Count + " 条，保留最近 3 天"
+        $statusLabel.Text = $modeText + "：共 " + $script:DisplayItems.Count + " 条，保留最近 30 天"
     }
     else {
         $statusLabel.Text = $modeText + "：匹配 " + $script:DisplayItems.Count + " / " + $script:HistoryItems.Count + " 条"
